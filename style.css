@@ -26,3 +26,32 @@
     flex: 1 1 auto;
     overflow-wrap: anywhere;
 }
+
+#send_form[data-private-routes-state] #send_but {
+    display: none !important;
+}
+#send_form[data-private-routes-state] #mes_stop {
+    display: flex !important;
+}
+#send_form[data-private-routes-state="saving"] #mes_stop {
+    opacity: 0.55;
+    pointer-events: none;
+}
+
+#private-routes-live {
+    margin: 0.5rem 0;
+    padding: 0.6rem 0.75rem;
+    border: 1px dashed var(--SmartThemeBorderColor);
+    border-radius: 0.5rem;
+    opacity: 0.92;
+}
+
+#private-routes-live .private-routes-live-label {
+    margin-bottom: 0.45rem;
+    color: var(--SmartThemeQuoteColor);
+    font-size: 0.8em;
+}
+
+#private-routes-live .private-routes-live-content {
+    overflow-wrap: anywhere;
+}

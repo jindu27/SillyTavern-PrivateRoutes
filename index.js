@@ -1,9 +1,10 @@
 import { shouldSendOnEnter } from '/scripts/RossAscends-mods.js';
-import { PLAYER, TURN_KEY, playTurn, readStory, storyClock } from './engine.js';
+import { PLAYER, STATE_KEY, TURN_KEY, playTurn, readStory, storyClock } from './engine.js';
 
 const SETTINGS_KEY = 'privateRoutes';
 const INPUT_KEY = 'privateRoutesInput';
 const SEND_SELECTOR = '#send_but';
+const STOP_SELECTOR = '#mes_stop';
 const NATIVE_GENERATION = '#option_regenerate, #option_continue, #mes_continue, #mes_impersonate, .group_member [data-action="speak"]';
 const getContext = () => globalThis.SillyTavern.getContext();
 let ui;
@@ -35,14 +36,19 @@ function disableNativeAutoMode() {
 function render() {
     if (!ui) return;
     const context = getContext();
-    const { group, cards, config } = current(context);
+    const { group, cards, config, chatId } = current(context);
+    const activeTurn = config?.enabled && running?.chatId === chatId && running?.groupId === group?.id;
+    if (activeTurn) {
+        ui.sendForm.dataset.privateRoutesState = running.saving ? 'saving' : 'generating';
+    } else {
+        delete ui.sendForm.dataset.privateRoutesState;
+    }
     ui.root.hidden = !group;
     if (!group) return;
     ui.enabled.checked = !!config.enabled;
     ui.enabled.disabled = Boolean(running);
     ui.main.hidden = !config.enabled;
     ui.main.disabled = Boolean(running);
-    ui.stop.hidden = !running;
     ui.status.hidden = !config.enabled;
     if (!config.enabled) return;
     disableNativeAutoMode();
@@ -50,7 +56,7 @@ function render() {
     for (const card of cards) ui.main.append(new Option(card.name, card.avatar));
     ui.main.value = cards.some(card => card.avatar === config.main) ? config.main : '';
     ui.status.textContent = status || (ui.main.value
-        ? sceneLabel(readStory(context.chat, config.main), cards, context.name1)
+        ? sceneLabel(readStory(context.chat, config.main, context.chatMetadata), cards, context.name1)
         : '选择一张主卡后发送消息');
 }
 
@@ -66,14 +72,26 @@ function roleSheet(card, otherName) {
         const value = data[key] || card[legacy];
         if (typeof value === 'string' && value.trim()) sheet[key] = localize(value);
     }
-    return { name: card.name, id: card.avatar, sheet };
+    return {
+        name: card.name,
+        id: card.avatar,
+        sheet,
+        showStatusBar: typeof data.system_prompt === 'string' && data.system_prompt.includes('【团子状态】'),
+    };
 }
 
 function markdownSafe(value) {
     return String(value).replace(/\\/g, '\\\\').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-function textOfTurn(turn, main, player, sides) {
+function cleanGeneratedText(value) {
+    return String(value)
+        .replace(/<state>[\s\S]*?<\/state>/gi, '')
+        .replace(/【团子状态】/g, '')
+        .trim();
+}
+
+function textOfTurn(turn, main, player, sides, includeStatus = true) {
     const sections = [];
     for (const route of [{ id: PLAYER, name: player.name }, ...sides]) {
         const events = turn.events.filter(event => event.route === route.id && ['main', 'side'].includes(event.kind))
@@ -81,7 +99,7 @@ function textOfTurn(turn, main, player, sides) {
         const lines = events.map(event => {
             const speaker = event.kind === 'main' ? main.name : route.name;
             const queued = event.pending ? ' · 约会期间来信' : '';
-            return '**' + markdownSafe(speaker) + '** · ' + storyClock(event.minute) + queued + '\n\n' + markdownSafe(event.text);
+            return '**' + markdownSafe(speaker) + '** · ' + storyClock(event.minute) + queued + '\n\n' + markdownSafe(cleanGeneratedText(event.text));
         });
         const title = '### @' + markdownSafe(route.id === PLAYER ? '你' : route.name);
         const mainActed = events.some(event => event.kind === 'main');
@@ -89,7 +107,51 @@ function textOfTurn(turn, main, player, sides) {
         if (!mainActed) lines.unshift(noAction);
         sections.push(title + '\n\n' + lines.join('\n\n'));
     }
-    return sections.join('\n\n---\n\n');
+    const body = sections.join('\n\n---\n\n');
+    return includeStatus && main.showStatusBar ? body + '\n\n【团子状态】' : body;
+}
+
+function stateLabel(state, routeId, routes) {
+    return routes.find(route => route.id === routeId)?.name ?? '无';
+}
+
+function syncStateVariables(context, state, main, player, sides) {
+    const local = context.variables?.local;
+    if (!local) return;
+    const routes = [{ id: PLAYER, name: player.name }, ...sides.map(card => ({ id: card.id, name: card.name }))];
+    const affinity = state?.affinity ?? {};
+    const value = id => String(Number.isFinite(Number(affinity[id])) ? affinity[id] : 0);
+    local.set('aff_me', value(PLAYER));
+    local.set('aff_user', value(PLAYER));
+    const luye = routes.find(route => route.name === '路野' || route.name === '周野');
+    const lushi = routes.find(route => route.name === '陆时');
+    if (luye) {
+        local.set('aff_luye', value(luye.id));
+        local.set('aff_zhouye', value(luye.id));
+    }
+    if (lushi) local.set('aff_lushi', value(lushi.id));
+    local.set('obsession_name', stateLabel(state, state?.obsession, routes));
+}
+
+function renderLivePreview(context, main, player, sides, turn, state) {
+    const chatElement = document.querySelector('#chat');
+    if (!chatElement) return;
+    syncStateVariables(context, state, main, player, sides);
+    let preview = document.querySelector('#private-routes-live');
+    if (!preview) {
+        preview = document.createElement('div');
+        preview.id = 'private-routes-live';
+        preview.className = 'mes private-routes-live';
+        chatElement.append(preview);
+    }
+    const body = textOfTurn(turn, main, player, sides);
+    preview.innerHTML = '<div class="private-routes-live-label">正在生成多线回复…</div><div class="private-routes-live-content"></div>';
+    const content = preview.querySelector('.private-routes-live-content');
+    content.innerHTML = context.messageFormatting(body, main.name, false, false, -1, {}, false);
+}
+
+function removeLivePreview() {
+    document.querySelector('#private-routes-live')?.remove();
 }
 
 function showError(message) {
@@ -99,7 +161,7 @@ function showError(message) {
 }
 
 function cancel() {
-    if (!running || running.saving) return;
+    if (!running || running.saving || running.controller.signal.aborted) return;
     running.controller.abort();
     getContext().stopGeneration();
 }
@@ -125,13 +187,17 @@ async function send() {
     const checkpoint = context.chat.slice();
     const controller = new AbortController();
     running = { controller, chatId, groupId: group.id };
+    render();
     try {
-        const story = readStory(checkpoint, main.id);
+        const story = readStory(checkpoint, main.id, context.chatMetadata);
         const turn = await playTurn({
             story, main, player, sides, input, signal: controller.signal,
             progress(message) {
                 status = message;
                 render();
+            },
+            async onUpdate({ turn: liveTurn, state }) {
+                renderLivePreview(context, main, player, sides, liveTurn, state);
             },
             historyBudget: Math.max(1500, Math.min(18000, Math.round((context.maxContext || 4096) * 1.65))),
             async generate(systemPrompt, prompt) {
@@ -150,7 +216,9 @@ async function send() {
         }
 
         running.saving = true;
-        ui.stop.hidden = true;
+        status = '正在保存本轮';
+        render();
+        removeLivePreview();
         const time = new Date().toISOString();
         const userMessage = { name: player.name, is_user: true, is_system: false, mes: input, send_date: time, extra: { [INPUT_KEY]: true } };
         const aiMessage = {
@@ -159,7 +227,7 @@ async function send() {
             mes: textOfTurn(turn, main, player, sides), extra: { [TURN_KEY]: turn },
         };
         // Pin the destination and its integrity header before awaiting I/O.
-        const metadata = { ...context.chatMetadata, tainted: true };
+        const metadata = { ...context.chatMetadata, [STATE_KEY]: turn.state, tainted: true };
         const header = { chat_metadata: metadata, user_name: 'unused', character_name: 'unused' };
         const response = await fetch('/api/chats/group/save', {
             method: 'POST', headers: context.getRequestHeaders(),
@@ -174,6 +242,7 @@ async function send() {
             return;
         }
         context.chatMetadata.tainted = true;
+        context.chatMetadata[STATE_KEY] = turn.state;
         context.chat.push(userMessage, aiMessage);
         const userIndex = checkpoint.length;
         context.addOneMessage(userMessage);
@@ -186,6 +255,7 @@ async function send() {
         await context.eventSource.emit(context.eventTypes.CHARACTER_MESSAGE_RENDERED, userIndex + 1);
         status = '';
     } catch (error) {
+        removeLivePreview();
         if (controller.signal.aborted) {
             status = '本轮已停止，可以重新发送。';
         } else {
@@ -193,6 +263,7 @@ async function send() {
             showError(error instanceof Error ? error.message : '模型请求失败，请检查连接后重试。');
         }
     } finally {
+        removeLivePreview();
         running = undefined;
         render();
     }
@@ -200,7 +271,11 @@ async function send() {
 
 function onClick(event) {
     if (!(event.target instanceof Element) || !current().config?.enabled) return;
-    if (event.target.closest(SEND_SELECTOR)) {
+    if (event.target.closest(STOP_SELECTOR) && ui.sendForm.dataset.privateRoutesState) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        cancel();
+    } else if (event.target.closest(SEND_SELECTOR)) {
         event.preventDefault();
         event.stopImmediatePropagation();
         void send();
@@ -220,16 +295,16 @@ function onKey(event) {
 }
 
 function initialize() {
-    if (ui || !document.querySelector('#send_form')) return;
+    const sendForm = document.querySelector('#send_form');
+    if (ui || !sendForm) return;
     const root = document.createElement('div');
     root.id = 'private-routes';
     root.hidden = true;
     root.innerHTML = '<label><input type="checkbox"> 多线群聊</label>' +
-        '<select aria-label="主卡"></select><span role="status" aria-live="polite"></span>' +
-        '<button type="button" class="menu_button" hidden>停止本轮</button>';
-    const [enabled, main, indicator, stop] = root.querySelectorAll('input, select, span, button');
-    ui = { root, enabled, main, status: indicator, stop };
-    document.querySelector('#send_form').before(root);
+        '<select aria-label="主卡"></select><span role="status" aria-live="polite"></span>';
+    const [enabled, main, indicator] = root.querySelectorAll('input, select, span');
+    ui = { root, enabled, main, status: indicator, sendForm };
+    sendForm.before(root);
     enabled.addEventListener('change', () => {
         const { config } = current();
         if (!config) return;
@@ -246,7 +321,6 @@ function initialize() {
         getContext().saveSettingsDebounced();
         render();
     });
-    stop.addEventListener('click', cancel);
     document.addEventListener('click', onClick, true);
     document.addEventListener('keydown', onKey, true);
     const { eventSource, eventTypes } = getContext();
