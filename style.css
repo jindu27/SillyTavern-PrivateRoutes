@@ -1,0 +1,28 @@
+#private-routes {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.35rem 0.75rem;
+    padding: 0.25rem 0.65rem;
+    border-top: 1px solid var(--SmartThemeBorderColor);
+    color: var(--SmartThemeBodyColor);
+    background: var(--SmartThemeBlurTintColor);
+    font-size: 0.85em;
+}
+#private-routes[hidden],
+#private-routes [hidden] {
+    display: none !important;
+}
+#private-routes label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    white-space: nowrap;
+}
+#private-routes select {
+    max-width: 12em;
+}
+#private-routes [role="status"] {
+    flex: 1 1 auto;
+    overflow-wrap: anywhere;
+}
