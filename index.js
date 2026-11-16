@@ -76,7 +76,9 @@ function roleSheet(card, otherName) {
         name: card.name,
         id: card.avatar,
         sheet,
-        showStatusBar: typeof data.system_prompt === 'string' && data.system_prompt.includes('【团子状态】'),
+        showStatusBar: (Array.isArray(data.extensions?.regex_scripts)
+            && data.extensions.regex_scripts.some(rule => rule?.scriptName === '团子状态栏' && !rule.disabled))
+            || (typeof data.system_prompt === 'string' && data.system_prompt.includes('aff_luye')),
     };
 }
 
