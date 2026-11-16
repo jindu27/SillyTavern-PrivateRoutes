@@ -93,6 +93,31 @@ function cleanGeneratedText(value) {
         .trim();
 }
 
+function affinityStage(score) {
+    if (score <= 20) return '陌生';
+    if (score <= 40) return '有点在意';
+    if (score <= 60) return '有好感';
+    if (score <= 80) return '喜欢';
+    return '执念';
+}
+
+function affinityBar(score) {
+    const filled = Math.max(0, Math.min(10, Math.round(score / 10)));
+    return '█'.repeat(filled) + '░'.repeat(10 - filled);
+}
+
+function statusBlock(turn, player, sides) {
+    const state = turn.state ?? { affinity: {}, obsession: null };
+    const routes = [{ id: PLAYER, name: player.name }, ...sides.map(card => ({ id: card.id, name: card.name }))];
+    const getScore = route => Math.max(0, Math.min(100, Number(state.affinity?.[route.id]) || 0));
+    const rows = routes.map(route => {
+        const score = getScore(route);
+        return `- **${markdownSafe(route.name)}**　\`${affinityBar(score)}\` ${score}/100 · ${affinityStage(score)}`;
+    });
+    const obsession = state.obsession ? stateLabel(state, state.obsession, routes) : '无';
+    return ['### 团子状态', '', ...rows, '', `心里那个人：**${markdownSafe(obsession)}**`].join('\n');
+}
+
 function textOfTurn(turn, main, player, sides, includeStatus = true) {
     const sections = [];
     for (const route of [{ id: PLAYER, name: player.name }, ...sides]) {
@@ -110,7 +135,7 @@ function textOfTurn(turn, main, player, sides, includeStatus = true) {
         sections.push(title + '\n\n' + lines.join('\n\n'));
     }
     const body = sections.join('\n\n---\n\n');
-    return includeStatus && main.showStatusBar ? body + '\n\n【团子状态】' : body;
+    return includeStatus && main.showStatusBar ? body + '\n\n' + statusBlock(turn, player, sides) : body;
 }
 
 function stateLabel(state, routeId, routes) {
