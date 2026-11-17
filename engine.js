@@ -88,9 +88,12 @@ function normalizeState(value, routes) {
             }
             : { issue: '', repeats: 0 };
     }
-    const obsession = typeof state.obsession === 'string' && routes.some(route => route.id === state.obsession)
-        ? state.obsession
-        : null;
+    const obsession = typeof state.obsession === 'string' && (
+        routes.some(route => route.id === state.obsession || route.stateIds?.includes(state.obsession))
+        || state.obsession === '$user'
+        || state.obsession === 'user'
+        || state.obsession.startsWith('alias_')
+    ) ? state.obsession : null;
     return { version: 2, affinity, obsession, familiarity, tension, friction };
 }
 

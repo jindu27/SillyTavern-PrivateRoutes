@@ -223,7 +223,9 @@ function statusBlock(turn, player, sides) {
         const score = Number.isFinite(Number(route.score)) ? Math.max(0, Math.min(100, Number(route.score))) : getScore(route);
         return `- **${markdownSafe(route.name)}**　\`${affinityBar(score)}\` ${score}/100 · ${affinityStage(score)}`;
     });
-    const obsession = state.obsession ? stateLabel(state, state.obsession, routes) : '无';
+    const identityName = state.obsession ? globalThis.privateRoutesIdentity?.displayNameFor?.(state.obsession) : '';
+    const fallbackUser = state.obsession === '$user' || state.obsession === 'user' ? '你' : '';
+    const obsession = state.obsession ? (identityName || fallbackUser || stateLabel(state, state.obsession, routes)) : '无';
     return ['### 团子状态', '', ...rows, '', `心里那个人：**${markdownSafe(obsession)}**`].join('\n');
 }
 
