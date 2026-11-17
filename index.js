@@ -216,7 +216,7 @@ function affinityBar(score) {
 
 function statusBlock(turn, player, sides) {
     const state = turn.state ?? { affinity: {}, obsession: null };
-    const routes = [{ id: PLAYER, name: player.name }, ...sides.map(card => ({ id: card.id, name: card.name }))];
+    const routes = [{ id: player.id ?? PLAYER, name: player.name }, ...sides.map(card => ({ id: card.id, name: card.name }))];
     const getScore = route => Math.max(0, Math.min(100, Number(state.affinity?.[route.id]) || 0));
     const rows = routes.map(route => {
         const score = getScore(route);
@@ -240,14 +240,14 @@ function textOfTurn(turn, main, player, sides, includeStatus = true, identitySta
     };
     if (mainMembers.length > 1) {
         for (const member of mainMembers) {
-            const events = turn.events.filter(event => event.route === PLAYER && event.kind === 'main' && event.from === member.id)
+            const events = turn.events.filter(event => event.route === player.id && event.kind === 'main' && event.from === member.id)
                 .sort((a, b) => a.minute - b.minute);
             renderSection(member.name, events);
         }
     } else {
-        const events = turn.events.filter(event => event.route === PLAYER && ['main', 'side'].includes(event.kind))
+        const events = turn.events.filter(event => event.route === player.id && ['main', 'side'].includes(event.kind))
             .sort((a, b) => a.minute - b.minute);
-        renderSection('你', events);
+        renderSection(player.name, events);
     }
     for (const route of sides) {
         const events = turn.events.filter(event => event.route === route.id && ['main', 'side'].includes(event.kind))
@@ -268,11 +268,12 @@ function stateLabel(state, routeId, routes) {
 function syncStateVariables(context, state, main, player, sides) {
     const local = context.variables?.local;
     if (!local) return;
-    const routes = [{ id: PLAYER, name: player.name }, ...sides.map(card => ({ id: card.id, name: card.name }))];
+    const playerId = player.id ?? PLAYER;
+    const routes = [{ id: playerId, name: player.name }, ...sides.map(card => ({ id: card.id, name: card.name }))];
     const affinity = state?.affinity ?? {};
     const value = id => String(Number.isFinite(Number(affinity[id])) ? affinity[id] : 0);
-    local.set('aff_me', value(PLAYER));
-    local.set('aff_user', value(PLAYER));
+    local.set('aff_me', value(playerId));
+    local.set('aff_user', value(playerId));
     const luye = routes.find(route => route.name === '路野' || route.name === '周野');
     const lushi = routes.find(route => route.name === '陆时');
     if (luye) {
@@ -360,7 +361,9 @@ async function send({ regenerate = false } = {}) {
     }
     const identityApi = globalThis.privateRoutesIdentity;
     const identity = await prepareIdentity(context, { chatId, group, input, chat: checkpoint, playerName: context.name1 });
-    const player = identity?.player ?? { name: context.name1 };
+    const player = identity?.player
+        ? { ...identity.player, id: identity.playerRoute?.id }
+        : { name: context.name1, id: PLAYER };
     const main = mainGroup(selectedMainCards, player.name);
     const sides = cards.filter(card => !selectedMainIds.includes(card.avatar)).map(card => roleSheet(card, main.name));
     const before = textarea.value;
