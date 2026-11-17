@@ -52,6 +52,9 @@ function cloneState(value) {
 function normalizeState(value, routes) {
     const state = value && typeof value === 'object' ? value : {};
     const affinity = {};
+    const familiarity = {};
+    const tension = {};
+    const friction = {};
     const oldKeys = new Map([
         ['aff_me', PLAYER],
         ['aff_user', PLAYER],
@@ -71,11 +74,22 @@ function normalizeState(value, routes) {
             }
         }
         affinity[route.id] = Math.max(0, Math.min(100, Math.round(Number.isFinite(score) ? score : 0)));
+        const familiarValue = Number(state.familiarity?.[route.id]);
+        familiarity[route.id] = Math.max(0, Math.min(100, Math.round(Number.isFinite(familiarValue) ? familiarValue : 0)));
+        const tensionValue = Number(state.tension?.[route.id]);
+        tension[route.id] = Math.max(0, Math.min(4, Math.round(Number.isFinite(tensionValue) ? tensionValue : 0)));
+        const previousFriction = state.friction?.[route.id];
+        friction[route.id] = previousFriction && typeof previousFriction === 'object'
+            ? {
+                issue: typeof previousFriction.issue === 'string' ? previousFriction.issue.slice(0, 80) : '',
+                repeats: Math.max(0, Math.min(20, Math.round(Number(previousFriction.repeats) || 0))),
+            }
+            : { issue: '', repeats: 0 };
     }
     const obsession = typeof state.obsession === 'string' && routes.some(route => route.id === state.obsession)
         ? state.obsession
         : null;
-    return { version: 1, affinity, obsession };
+    return { version: 2, affinity, obsession, familiarity, tension, friction };
 }
 
 function parseStateUpdates(value, allowed) {
@@ -87,6 +101,27 @@ function parseStateUpdates(value, allowed) {
         used.add(update.to);
         check(Number.isSafeInteger(update.affinity_delta) && update.affinity_delta >= -10 && update.affinity_delta <= 10, 'affinity_delta 必须是 -10 到 10 的整数。');
         return { to: update.to, affinityDelta: update.affinity_delta };
+    });
+}
+
+function parseRelationshipUpdates(value, allowed) {
+    if (value.relationship_updates === undefined) return [];
+    check(Array.isArray(value.relationship_updates), 'relationship_updates 必须是数组。');
+    const used = new Set();
+    return value.relationship_updates.map(update => {
+        check(update && allowed.includes(update.to) && !used.has(update.to), 'relationship_updates 只能使用允许的对象编号，每个对象一项。');
+        used.add(update.to);
+        const familiarityDelta = update.familiarity_delta ?? 0;
+        const tensionDelta = update.tension_delta ?? 0;
+        check(Number.isSafeInteger(familiarityDelta) && familiarityDelta >= 0 && familiarityDelta <= 3, 'familiarity_delta 必须是 0 到 3 的整数。');
+        check(Number.isSafeInteger(tensionDelta) && tensionDelta >= -2 && tensionDelta <= 2, 'tension_delta 必须是 -2 到 2 的整数。');
+        if (update.issue !== undefined) check(typeof update.issue === 'string' && update.issue.length <= 80, 'issue 必须是长度合适的文本。');
+        return {
+            to: update.to,
+            familiarityDelta,
+            tensionDelta,
+            issue: typeof update.issue === 'string' ? update.issue.trim() : '',
+        };
     });
 }
 
@@ -156,7 +191,7 @@ function segments(items, allowed, required = []) {
     return result;
 }
 
-export async function playTurn({ story, main, player, sides, input, generate, signal, progress, onUpdate, historyBudget = 11000 }) {
+export async function playTurn({ story, main, player, sides, input, generate, signal, progress, onUpdate, historyBudget = 11000, worldRules = {} }) {
     const routes = [{ ...player, id: PLAYER, key: 'user' }, ...sides.map((card, index) => ({ ...card, key: 'c' + (index + 1) }))];
     const byKey = new Map(routes.map(route => [route.key, route]));
     const keyFor = id => routes.find(route => route.id === id)?.key;
@@ -166,6 +201,7 @@ export async function playTurn({ story, main, player, sides, input, generate, si
 
     const state = { events: [...story.events], minute: story.minute, date: previousDate };
     const routeState = normalizeState(story.state, routes);
+    const mainRules = typeof worldRules.main === 'string' ? worldRules.main : '';
     const turn = { version: 1, main: main.id, minute: story.minute, date: previousDate, focus: previousDate, events: [], state: cloneState(routeState) };
     const emit = (route, kind, text, minute, flags = {}) => {
         const event = { route, kind, text, minute, ...flags };
@@ -180,6 +216,9 @@ export async function playTurn({ story, main, player, sides, input, generate, si
         relationship_state: {
             affinity: routes.reduce((result, route) => ({ ...result, [route.key]: routeState.affinity[route.id] }), {}),
             obsession: keyFor(routeState.obsession) ?? null,
+            familiarity: routes.reduce((result, route) => ({ ...result, [route.key]: routeState.familiarity[route.id] }), {}),
+            tension: routes.reduce((result, route) => ({ ...result, [route.key]: routeState.tension[route.id] }), {}),
+            friction: routes.reduce((result, route) => ({ ...result, [route.key]: routeState.friction[route.id] }), {}),
         },
     });
     const applyStateUpdates = updates => {
@@ -200,6 +239,22 @@ export async function playTurn({ story, main, player, sides, input, generate, si
         }
         turn.state = cloneState(routeState);
     };
+    const applyRelationshipUpdates = updates => {
+        for (const update of updates) {
+            const route = byKey.get(update.to);
+            if (!route) continue;
+            routeState.familiarity[route.id] = Math.max(0, Math.min(100, routeState.familiarity[route.id] + update.familiarityDelta));
+            routeState.tension[route.id] = Math.max(0, Math.min(4, routeState.tension[route.id] + update.tensionDelta));
+            if (update.issue) {
+                const previous = routeState.friction[route.id];
+                routeState.friction[route.id] = {
+                    issue: update.issue,
+                    repeats: previous.issue === update.issue ? previous.repeats + 1 : 1,
+                };
+            }
+        }
+        turn.state = cloneState(routeState);
+    };
     const publish = async () => {
         turn.state = cloneState(routeState);
         if (onUpdate) await onUpdate({ turn, state: cloneState(routeState) });
@@ -210,8 +265,9 @@ export async function playTurn({ story, main, player, sides, input, generate, si
         '只有实际见面进入线下约会，线上邀约不算。如果开始或结束时间在本轮内，用相对于本轮开始的分钟数。正在约会时保留相同对象，startsAt 填 null，endsAt 为 null 时约会继续。如果本轮无约会，date 填 null。',
         '只要本轮包含约会，actions 只允许约会对象，此处仅写约会内的互动。集中回复要等下一步。在线上时，actions 可写任一对象。',
         'inputKind 为 "message" 时，玩家文本是发给主卡的话。只有纯剧情指令、时间跳转或旁白时填 "narration"；和玩家约会时，玩家写给主卡的台词与动作仍归入双方情节。',
-        '格式 {"elapsed":0,"inputKind":"message","date":null,"actions":[{"to":"user","text":"行动或台词"}],"state_updates":[{"to":"user","affinity_delta":0}]}。date 对象格式 {"with":"c1","startsAt":0,"endsAt":null}。每个 to 使用 routes 中的编号，禁止在 text 里代写其他人的回复。state_updates 只记录本轮感情变化，没有变化就返回空数组。',
-    ].join('\n'), { ...common(), activeDate: previousKey ?? null, playerInput: input }, value => {
+        '关系发展要渐进。熟悉度只在有意义的共同经历后增加。缺点先表现为轻微不适，只有明确触及边界、重复发生且对方拒绝调整时才增加张力。单次最多推进一个主要冲突，不要让所有关系同时吵架。',
+        '格式 {"elapsed":0,"inputKind":"message","date":null,"actions":[{"to":"user","text":"行动或台词"}],"state_updates":[{"to":"user","affinity_delta":0}],"relationship_updates":[{"to":"c1","familiarity_delta":0,"tension_delta":0,"issue":""}]}。date 对象格式 {"with":"c1","startsAt":0,"endsAt":null}。每个 to 使用 routes 中的编号，禁止在 text 里代写其他人的回复。state_updates 只记录本轮感情变化，没有变化就返回空数组。relationship_updates 只记录明确发生的关系变化，没有变化就返回空数组。issue 只写当前最主要的未解决问题。',
+    ].join('\n'), { ...common(), relationship_rules: mainRules || null, activeDate: previousKey ?? null, playerInput: input }, value => {
         const elapsed = relativeMinute(value.elapsed, 0, Number.MAX_SAFE_INTEGER - story.minute);
         check(['message', 'narration'].includes(value.inputKind), 'inputKind 必须是 message 或 narration。');
         let date = null;
@@ -226,13 +282,21 @@ export async function playTurn({ story, main, player, sides, input, generate, si
             check(!previousKey, '已有约会时需要明确填入约会对象和是否结束。');
         }
         const allowed = date ? [date.key] : [...byKey.keys()];
-        return { elapsed, date, inputKind: value.inputKind, actions: segments(value.actions, allowed), stateUpdates: parseStateUpdates(value, [...byKey.keys()]) };
+        return {
+            elapsed,
+            date,
+            inputKind: value.inputKind,
+            actions: segments(value.actions, allowed),
+            stateUpdates: parseStateUpdates(value, [...byKey.keys()]),
+            relationshipUpdates: parseRelationshipUpdates(value, allowed),
+        };
     }, signal);
 
     const start = story.minute;
     const end = start + plan.elapsed;
     const date = plan.date;
     applyStateUpdates(plan.stateUpdates);
+    applyRelationshipUpdates(plan.relationshipUpdates);
     state.minute = end;
     state.date = date && !date.ends ? date.id : null;
     turn.minute = end;
@@ -256,6 +320,7 @@ export async function playTurn({ story, main, player, sides, input, generate, si
         progress(background ? route.name + ' 正在独立行动' : '等待 ' + route.name + ' 回应');
         const own = state.events.filter(event => event.route === route.id && event.kind !== 'direction');
         const messages = await ask(generate, SIDE_SYSTEM, [
+            '资料中的 relationship_rules 是当前世界书对关系发展、冲突和修复的规则。只使用与自己这条关系有关的部分。relationship_state 是当前熟悉度、张力和未解决问题，不要把它当成必须立即爆发的剧情。',
             action ? '主卡已对你采取行动，你必须回应一次。'
                 : background ? '根据你自己的经历决定在这段时间里要不要主动给主卡发消息。只写发出去的消息，可以一条都不发。'
                     : '你可以根据自己的经历主动联系主卡，或跳过本轮。最多一条。',
@@ -263,6 +328,12 @@ export async function playTurn({ story, main, player, sides, input, generate, si
         ].join('\n'), {
             character: route.sheet,
             partner: main.name,
+            relationship_rules: worldRules.byRouteId?.[route.id] || '',
+            relationship_state: {
+                familiarity: routeState.familiarity[route.id],
+                tension: routeState.tension[route.id],
+                friction: routeState.friction[route.id],
+            },
             history: recent(own, historyBudget),
             latestAction: action?.text ?? null,
             startsAt: storyClock(start),
@@ -285,10 +356,14 @@ export async function playTurn({ story, main, player, sides, input, generate, si
     const mainWrites = async (eligible, must, instructions, latest) => {
         progress(main.name + ' 正在决定如何接话');
         return ask(generate, MAIN_SYSTEM, '本步骤只写主卡说的话或做的事。' + instructions +
-            '\n格式 {"actions":[{"to":"c1","text":"行动或台词"}],"state_updates":[{"to":"c1","affinity_delta":0}]}。允许参与的编号在 eligible 中，必须回复的编号在 mustReply 中。无行动可返回 {"actions":[]}。state_updates 只记录本轮感情变化，没有变化就返回空数组。',
-        { ...common(), eligible, mustReply: must, latest: latest.map(event => ({
+            '\n格式 {"actions":[{"to":"c1","text":"行动或台词"}],"state_updates":[{"to":"c1","affinity_delta":0}],"relationship_updates":[{"to":"c1","familiarity_delta":0,"tension_delta":0,"issue":""}]}。允许参与的编号在 eligible 中，必须回复的编号在 mustReply 中。无行动可返回 {"actions":[]}。state_updates 和 relationship_updates 没有变化时返回空数组。',
+        { ...common(), relationship_rules: mainRules || null, eligible, mustReply: must, latest: latest.map(event => ({
             to: keyFor(event.route), text: event.text, time: storyClock(event.minute),
-        })) }, value => ({ actions: segments(value.actions, eligible, must), stateUpdates: parseStateUpdates(value, eligible) }), signal);
+        })) }, value => ({
+            actions: segments(value.actions, eligible, must),
+            stateUpdates: parseStateUpdates(value, eligible),
+            relationshipUpdates: parseRelationshipUpdates(value, eligible),
+        }), signal);
     };
 
     const responses = [];
@@ -317,6 +392,7 @@ export async function playTurn({ story, main, player, sides, input, generate, si
             const keys = ready.map(route => route.key);
             const replies = await mainWrites(keys, keys, '约会已结束或已有待补回的来信。在同一次输出中按对象分别集中回复待处理消息。', deferred);
             applyStateUpdates(replies.stateUpdates);
+            applyRelationshipUpdates(replies.relationshipUpdates);
             for (const action of sendMain(replies.actions, end, keys)) {
                 const route = routes.find(candidate => candidate.id === action.route);
                 if (route.id !== PLAYER) responses.push(...await sendSide(route, action, { from: end, until: end }));
@@ -330,6 +406,7 @@ export async function playTurn({ story, main, player, sides, input, generate, si
         const keys = [...new Set(latest.map(event => keyFor(event.route)))];
         const replies = await mainWrites(keys, [], '自行决定现在是否接话。剧情适合收尾或可以等用户下一轮时，返回空数组。不要为了填满回合而继续。', latest);
         applyStateUpdates(replies.stateUpdates);
+        applyRelationshipUpdates(replies.relationshipUpdates);
         if (!replies.actions.length) break;
         latest = [];
         for (const action of sendMain(replies.actions, end)) {

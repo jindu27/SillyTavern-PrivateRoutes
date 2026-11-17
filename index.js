@@ -15,9 +15,72 @@ function current(context = getContext()) {
     const group = context.groups.find(item => String(item.id) === String(context.groupId));
     if (!group || !context.chatId) return {};
     const groups = context.extensionSettings[SETTINGS_KEY] ??= {};
-    const config = groups[String(group.id)] ??= { enabled: false, main: '' };
+    const config = groups[String(group.id)] ??= { enabled: false, main: '', worldbook: '' };
     const cards = group.members.map(id => context.characters.find(card => card.avatar === id)).filter(Boolean);
     return { group, config, cards, chatId: context.chatId };
+}
+
+function worldbookNames(context) {
+    return typeof context.getWorldInfoNames === 'function' ? context.getWorldInfoNames() : [];
+}
+
+function entryTargets(entry) {
+    const meta = entry?.extensions?.privateRoutes;
+    const target = meta?.target ?? entry?.privateRoutesTarget;
+    if (target === undefined || target === null || target === '') return ['all'];
+    return Array.isArray(target) ? target.map(String) : [String(target)];
+}
+
+function targetMatches(entry, role) {
+    const targets = entryTargets(entry);
+    return targets.includes('all') || targets.includes(role) || (role !== 'main' && targets.includes(role.name));
+}
+
+function regexKeyMatch(text, key) {
+    if (typeof key !== 'string' || !key) return false;
+    if (key.startsWith('/') && key.lastIndexOf('/') > 0) {
+        const end = key.lastIndexOf('/');
+        try {
+            return new RegExp(key.slice(1, end), key.slice(end + 1)).test(text);
+        } catch {
+            return false;
+        }
+    }
+    return text.toLocaleLowerCase().includes(key.toLocaleLowerCase());
+}
+
+function entryMatches(entry, text) {
+    if (entry.constant || entry.extensions?.privateRoutes?.always) return true;
+    const primary = Array.isArray(entry.key) ? entry.key : [];
+    if (!primary.some(key => regexKeyMatch(text, key))) return false;
+    const secondary = Array.isArray(entry.keysecondary) ? entry.keysecondary : [];
+    if (!secondary.length) return true;
+    const matches = secondary.filter(key => regexKeyMatch(text, key)).length;
+    return Number(entry.selectiveLogic) === 1 ? matches === secondary.length : matches > 0;
+}
+
+function formatWorldbookEntries(data, role, scanText, includeTriggered) {
+    const entries = data?.entries && typeof data.entries === 'object' ? Object.values(data.entries) : [];
+    return entries
+        .filter(entry => targetMatches(entry, role))
+        .filter(entry => includeTriggered ? entryMatches(entry, scanText) : Boolean(entry.constant || entry.extensions?.privateRoutes?.always))
+        .sort((a, b) => Number(a.order ?? a.insertion_order ?? 100) - Number(b.order ?? b.insertion_order ?? 100))
+        .map(entry => typeof entry.content === 'string' ? entry.content.trim() : '')
+        .filter(Boolean)
+        .join('\n\n');
+}
+
+async function loadWorldRules(context, worldbook, main, sides, input, checkpoint, story) {
+    if (!worldbook || typeof context.loadWorldInfo !== 'function') return { main: '', byRouteId: {} };
+    const data = await context.loadWorldInfo(worldbook);
+    const allText = [...checkpoint.slice(-12).map(message => message.mes || ''), input].join('\n');
+    const mainText = formatWorldbookEntries(data, 'main', allText, true);
+    const byRouteId = {};
+    for (const side of sides) {
+        const ownText = [...(story?.events ?? []).filter(event => event.route === side.id).slice(-12).map(event => event.text), input].join('\n');
+        byRouteId[side.id] = formatWorldbookEntries(data, side, ownText, false);
+    }
+    return { main: mainText, byRouteId };
 }
 
 function sceneLabel({ minute, date }, cards, username) {
@@ -49,14 +112,19 @@ function render() {
     ui.enabled.disabled = Boolean(running);
     ui.main.hidden = !config.enabled;
     ui.main.disabled = Boolean(running);
+    ui.worldbook.hidden = !config.enabled;
+    ui.worldbook.disabled = Boolean(running);
     ui.status.hidden = !config.enabled;
     if (!config.enabled) return;
     disableNativeAutoMode();
     ui.main.replaceChildren(new Option('选择主卡', ''));
     for (const card of cards) ui.main.append(new Option(card.name, card.avatar));
     ui.main.value = cards.some(card => card.avatar === config.main) ? config.main : '';
+    ui.worldbook.replaceChildren(new Option('不注入世界书', ''));
+    for (const name of worldbookNames(context)) ui.worldbook.append(new Option(name, name));
+    ui.worldbook.value = worldbookNames(context).includes(config.worldbook) ? config.worldbook : '';
     ui.status.textContent = status || (ui.main.value
-        ? sceneLabel(readStory(context.chat, config.main, context.chatMetadata), cards, context.name1)
+        ? sceneLabel(readStory(context.chat, config.main, context.chatMetadata), cards, context.name1) + (ui.worldbook.value ? ' · 世界书已注入' : '')
         : '选择一张主卡后发送消息');
 }
 
@@ -217,8 +285,9 @@ async function send() {
     render();
     try {
         const story = readStory(checkpoint, main.id, context.chatMetadata);
+        const worldRules = await loadWorldRules(context, config.worldbook, main, sides, input, checkpoint, story);
         const turn = await playTurn({
-            story, main, player, sides, input, signal: controller.signal,
+            story, main, player, sides, input, worldRules, signal: controller.signal,
             progress(message) {
                 status = message;
                 render();
@@ -328,9 +397,11 @@ function initialize() {
     root.id = 'private-routes';
     root.hidden = true;
     root.innerHTML = '<label><input type="checkbox"> 多线群聊</label>' +
-        '<select aria-label="主卡"></select><span role="status" aria-live="polite"></span>';
-    const [enabled, main, indicator] = root.querySelectorAll('input, select, span');
-    ui = { root, enabled, main, status: indicator, sendForm };
+        '<select aria-label="主卡"></select>' +
+        '<select aria-label="关系世界书"></select>' +
+        '<span role="status" aria-live="polite"></span>';
+    const [enabled, main, worldbook, indicator] = root.querySelectorAll('input, select, span');
+    ui = { root, enabled, main, worldbook, status: indicator, sendForm };
     sendForm.before(root);
     enabled.addEventListener('change', () => {
         const { config } = current();
@@ -344,6 +415,14 @@ function initialize() {
         const { config } = current();
         if (!config) return;
         config.main = main.value;
+        status = '';
+        getContext().saveSettingsDebounced();
+        render();
+    });
+    worldbook.addEventListener('change', () => {
+        const { config } = current();
+        if (!config) return;
+        config.worldbook = worldbook.value;
         status = '';
         getContext().saveSettingsDebounced();
         render();
