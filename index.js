@@ -11,11 +11,22 @@ let ui;
 let running;
 let status = '';
 
+function asList(value) {
+    const values = Array.isArray(value) ? value : (value ? [value] : []);
+    return [...new Set(values.filter(item => typeof item === 'string' && item))];
+}
+
+function mainSelectionKey(value) {
+    return asList(value).join('|');
+}
+
 function current(context = getContext()) {
     const group = context.groups.find(item => String(item.id) === String(context.groupId));
     if (!group || !context.chatId) return {};
     const groups = context.extensionSettings[SETTINGS_KEY] ??= {};
-    const config = groups[String(group.id)] ??= { enabled: false, main: '', worldbook: '' };
+    const config = groups[String(group.id)] ??= { enabled: false, main: [], worldbook: [] };
+    config.main = asList(config.main);
+    config.worldbook = asList(config.worldbook);
     const cards = group.members.map(id => context.characters.find(card => card.avatar === id)).filter(Boolean);
     return { group, config, cards, chatId: context.chatId };
 }
@@ -70,15 +81,16 @@ function formatWorldbookEntries(data, role, scanText, includeTriggered) {
         .join('\n\n');
 }
 
-async function loadWorldRules(context, worldbook, main, sides, input, checkpoint, story) {
-    if (!worldbook || typeof context.loadWorldInfo !== 'function') return { main: '', byRouteId: {} };
-    const data = await context.loadWorldInfo(worldbook);
+async function loadWorldRules(context, worldbooks, main, sides, input, checkpoint, story) {
+    const selected = asList(worldbooks);
+    if (!selected.length || typeof context.loadWorldInfo !== 'function') return { main: '', byRouteId: {} };
+    const data = await Promise.all(selected.map(name => context.loadWorldInfo(name)));
     const allText = [...checkpoint.slice(-12).map(message => message.mes || ''), input].join('\n');
-    const mainText = formatWorldbookEntries(data, 'main', allText, true);
+    const mainText = data.map(book => formatWorldbookEntries(book, 'main', allText, true)).filter(Boolean).join('\n\n');
     const byRouteId = {};
     for (const side of sides) {
         const ownText = [...(story?.events ?? []).filter(event => event.route === side.id).slice(-12).map(event => event.text), input].join('\n');
-        byRouteId[side.id] = formatWorldbookEntries(data, side, ownText, false);
+        byRouteId[side.id] = data.map(book => formatWorldbookEntries(book, side, ownText, false)).filter(Boolean).join('\n\n');
     }
     return { main: mainText, byRouteId };
 }
@@ -117,15 +129,29 @@ function render() {
     ui.status.hidden = !config.enabled;
     if (!config.enabled) return;
     disableNativeAutoMode();
-    ui.main.replaceChildren(new Option('选择主卡', ''));
-    for (const card of cards) ui.main.append(new Option(card.name, card.avatar));
-    ui.main.value = cards.some(card => card.avatar === config.main) ? config.main : '';
-    ui.worldbook.replaceChildren(new Option('不注入世界书', ''));
-    for (const name of worldbookNames(context)) ui.worldbook.append(new Option(name, name));
-    ui.worldbook.value = worldbookNames(context).includes(config.worldbook) ? config.worldbook : '';
-    ui.status.textContent = status || (ui.main.value
-        ? sceneLabel(readStory(context.chat, config.main, context.chatMetadata), cards, context.name1) + (ui.worldbook.value ? ' · 世界书已注入' : '')
-        : '选择一张主卡后发送消息');
+    ui.main.replaceChildren();
+    const selectedMain = config.main.filter(id => cards.some(card => card.avatar === id));
+    for (const card of cards) {
+        const option = new Option(card.name, card.avatar);
+        option.selected = selectedMain.includes(card.avatar);
+        ui.main.append(option);
+    }
+    ui.worldbook.replaceChildren();
+    const names = worldbookNames(context);
+    const selectedBooks = config.worldbook.filter(name => names.includes(name));
+    for (const name of names) {
+        const option = new Option(name, name);
+        option.selected = selectedBooks.includes(name);
+        ui.worldbook.append(option);
+    }
+    const selectedMainNames = cards.filter(card => selectedMain.includes(card.avatar)).map(card => card.name);
+    const selectedBookNames = selectedBooks.join('、');
+    ui.status.textContent = status || (selectedMain.length
+        ? sceneLabel(readStory(context.chat, mainSelectionKey(selectedMain), context.chatMetadata), cards, context.name1) +
+            (selectedBookNames ? ' · 世界书：' + selectedBookNames : '')
+        : '选择一张或多张主卡后发送消息');
+    ui.main.title = selectedMainNames.length ? '主卡：' + selectedMainNames.join('、') : '可多选主卡';
+    ui.worldbook.title = selectedBookNames ? '世界书：' + selectedBookNames : '可多选世界书';
 }
 
 function roleSheet(card, otherName) {
@@ -147,6 +173,20 @@ function roleSheet(card, otherName) {
         showStatusBar: (Array.isArray(data.extensions?.regex_scripts)
             && data.extensions.regex_scripts.some(rule => rule?.scriptName === '团子状态栏' && !rule.disabled))
             || (typeof data.system_prompt === 'string' && data.system_prompt.includes('aff_luye')),
+    };
+}
+
+function mainGroup(cards, playerName) {
+    const members = cards.map((card, index) => ({ ...roleSheet(card, playerName), key: 'm' + (index + 1) }));
+    const id = mainSelectionKey(members.map(member => member.id));
+    const name = members.map(member => member.name).join('、');
+    return {
+        id,
+        name,
+        avatar: members[0]?.id ?? id,
+        sheet: { name, description: '由多张主卡共同负责规划本轮剧情。请根据 main_cards 保持每张主卡的独立口吻。' },
+        members,
+        showStatusBar: members.some(member => member.showStatusBar),
     };
 }
 
@@ -188,19 +228,31 @@ function statusBlock(turn, player, sides) {
 
 function textOfTurn(turn, main, player, sides, includeStatus = true) {
     const sections = [];
-    for (const route of [{ id: PLAYER, name: player.name }, ...sides]) {
-        const events = turn.events.filter(event => event.route === route.id && ['main', 'side'].includes(event.kind))
-            .sort((a, b) => a.minute - b.minute);
+    const mainMembers = main.members?.length ? main.members : [{ id: main.id, name: main.name }];
+    const renderSection = (title, events, noAction = '主卡本轮无行为') => {
         const lines = events.map(event => {
-            const speaker = event.kind === 'main' ? main.name : route.name;
+            const speaker = event.kind === 'main' ? (event.fromName || main.name) : title;
             const queued = event.pending ? ' · 约会期间来信' : '';
             return '**' + markdownSafe(speaker) + '** · ' + storyClock(event.minute) + queued + '\n\n' + markdownSafe(cleanGeneratedText(event.text));
         });
-        const title = '### @' + markdownSafe(route.id === PLAYER ? '你' : route.name);
-        const mainActed = events.some(event => event.kind === 'main');
-        const noAction = '主卡本轮无行为';
-        if (!mainActed) lines.unshift(noAction);
-        sections.push(title + '\n\n' + lines.join('\n\n'));
+        if (!events.some(event => event.kind === 'main')) lines.unshift(noAction);
+        sections.push('### @' + markdownSafe(title) + '\n\n' + lines.join('\n\n'));
+    };
+    if (mainMembers.length > 1) {
+        for (const member of mainMembers) {
+            const events = turn.events.filter(event => event.route === PLAYER && event.kind === 'main' && event.from === member.id)
+                .sort((a, b) => a.minute - b.minute);
+            renderSection(member.name, events);
+        }
+    } else {
+        const events = turn.events.filter(event => event.route === PLAYER && ['main', 'side'].includes(event.kind))
+            .sort((a, b) => a.minute - b.minute);
+        renderSection('你', events);
+    }
+    for (const route of sides) {
+        const events = turn.events.filter(event => event.route === route.id && ['main', 'side'].includes(event.kind))
+            .sort((a, b) => a.minute - b.minute);
+        renderSection(route.name, events);
     }
     const body = sections.join('\n\n---\n\n');
     return includeStatus && main.showStatusBar ? body + '\n\n' + statusBlock(turn, player, sides) : body;
@@ -261,33 +313,51 @@ function cancel() {
     getContext().stopGeneration();
 }
 
-async function send() {
+function regenerate() {
+    void send({ regenerate: true });
+}
+
+async function send({ regenerate = false } = {}) {
     if (running) return;
     const context = getContext();
     const { group, config, cards, chatId } = current(context);
     if (!config?.enabled) return;
     const textarea = document.querySelector('#send_textarea');
-    const input = textarea?.value.trim();
+    const originalChat = context.chat.slice();
+    let input = textarea?.value.trim();
+    let checkpoint = originalChat;
+    if (regenerate) {
+        const aiIndex = originalChat.length - 1;
+        const userIndex = aiIndex - 1;
+        const previousUser = originalChat[userIndex];
+        const previousAi = originalChat[aiIndex];
+        if (!previousUser?.extra?.[INPUT_KEY] || !previousAi?.extra?.[TURN_KEY]) {
+            return showError('上一条不是多线群聊回复，无法由扩展重新生成。');
+        }
+        input = String(previousUser.mes || '').trim();
+        checkpoint = originalChat.slice(0, userIndex);
+    }
     if (!input) return;
-    const mainCard = cards.find(card => card.avatar === config.main);
-    if (!mainCard) return showError('请先选择当前群聊的主卡。');
+    const selectedMainIds = asList(config.main).filter(id => cards.some(card => card.avatar === id));
+    const selectedMainCards = cards.filter(card => selectedMainIds.includes(card.avatar));
+    if (!selectedMainCards.length) return showError('请先选择一张或多张主卡。');
     if (context.onlineStatus === 'no_connection') return showError('请先连接酒馆的模型。');
     if (document.querySelector('#file_form_input')?.files?.length || document.querySelector('#embed_file_input')?.files?.length) {
         return showError('多线群聊目前支持文本。请先移除附件。');
     }
     const player = { name: context.name1 };
-    const main = roleSheet(mainCard, player.name);
-    const sides = cards.filter(card => card !== mainCard).map(card => roleSheet(card, main.name));
+    const main = mainGroup(selectedMainCards, player.name);
+    const sides = cards.filter(card => !selectedMainIds.includes(card.avatar)).map(card => roleSheet(card, main.name));
     const before = textarea.value;
-    const checkpoint = context.chat.slice();
     const controller = new AbortController();
-    running = { controller, chatId, groupId: group.id };
+    running = { controller, chatId, groupId: group.id, regenerate };
     render();
     try {
-        const story = readStory(checkpoint, main.id, context.chatMetadata);
+        const storyMetadata = regenerate ? { ...context.chatMetadata, [STATE_KEY]: null } : context.chatMetadata;
+        const story = readStory(checkpoint, main.id, storyMetadata);
         const worldRules = await loadWorldRules(context, config.worldbook, main, sides, input, checkpoint, story);
         const turn = await playTurn({
-            story, main, player, sides, input, worldRules, signal: controller.signal,
+            story, main, mainCards: main.members, player, sides, input, worldRules, signal: controller.signal,
             progress(message) {
                 status = message;
                 render();
@@ -307,7 +377,7 @@ async function send() {
         controller.signal.throwIfAborted();
         const active = current();
         if (active.chatId !== chatId || active.group?.id !== group.id ||
-            context.chat.length !== checkpoint.length || checkpoint.some((message, index) => context.chat[index] !== message)) {
+            context.chat.length !== originalChat.length || originalChat.some((message, index) => context.chat[index] !== message)) {
             throw new Error('生成期间群聊已变化。本轮未写入，请在当前会话重试。');
         }
 
@@ -319,7 +389,7 @@ async function send() {
         const userMessage = { name: player.name, is_user: true, is_system: false, mes: input, send_date: time, extra: { [INPUT_KEY]: true } };
         const aiMessage = {
             name: main.name, is_user: false, is_system: false, send_date: time,
-            force_avatar: context.getThumbnailUrl('avatar', main.id), original_avatar: main.id,
+            force_avatar: context.getThumbnailUrl('avatar', main.avatar), original_avatar: main.avatar,
             mes: textOfTurn(turn, main, player, sides), extra: { [TURN_KEY]: turn },
         };
         // Pin the destination and its integrity header before awaiting I/O.
@@ -332,8 +402,17 @@ async function send() {
         if (!response.ok) throw new Error('酒馆未能保存本轮。输入仍保留，请检查连接或刷新会话后重试。');
         const open = current();
         if (open.chatId !== chatId || open.group?.id !== group.id ||
-            context.chat.length !== checkpoint.length || checkpoint.some((message, index) => context.chat[index] !== message)) {
+            context.chat.length !== originalChat.length || originalChat.some((message, index) => context.chat[index] !== message)) {
             if (open.chatId === chatId) await context.reloadCurrentChat();
+            status = '';
+            return;
+        }
+        if (regenerate) {
+            await context.reloadCurrentChat();
+            if (textarea.value === before) {
+                textarea.value = '';
+                textarea.dispatchEvent(new Event('input', { bubbles: true }));
+            }
             status = '';
             return;
         }
@@ -375,6 +454,10 @@ function onClick(event) {
         event.preventDefault();
         event.stopImmediatePropagation();
         void send();
+    } else if (event.target.closest('#option_regenerate')) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        regenerate();
     } else if (event.target.closest(NATIVE_GENERATION + ', #rm_group_automode')) {
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -397,8 +480,8 @@ function initialize() {
     root.id = 'private-routes';
     root.hidden = true;
     root.innerHTML = '<label><input type="checkbox"> 多线群聊</label>' +
-        '<select aria-label="主卡"></select>' +
-        '<select aria-label="关系世界书"></select>' +
+        '<label>主卡<select aria-label="主卡（可多选）" multiple size="3"></select></label>' +
+        '<label>关系世界书<select aria-label="关系世界书（可多选）" multiple size="3"></select></label>' +
         '<span role="status" aria-live="polite"></span>';
     const [enabled, main, worldbook, indicator] = root.querySelectorAll('input, select, span');
     ui = { root, enabled, main, worldbook, status: indicator, sendForm };
@@ -414,7 +497,7 @@ function initialize() {
     main.addEventListener('change', () => {
         const { config } = current();
         if (!config) return;
-        config.main = main.value;
+        config.main = [...main.selectedOptions].map(option => option.value);
         status = '';
         getContext().saveSettingsDebounced();
         render();
@@ -422,7 +505,7 @@ function initialize() {
     worldbook.addEventListener('change', () => {
         const { config } = current();
         if (!config) return;
-        config.worldbook = worldbook.value;
+        config.worldbook = [...worldbook.selectedOptions].map(option => option.value);
         status = '';
         getContext().saveSettingsDebounced();
         render();

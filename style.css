@@ -22,6 +22,10 @@
 #private-routes select {
     max-width: 12em;
 }
+#private-routes select[multiple] {
+    min-width: 9em;
+    min-height: 4.8em;
+}
 #private-routes [role="status"] {
     flex: 1 1 auto;
     overflow-wrap: anywhere;

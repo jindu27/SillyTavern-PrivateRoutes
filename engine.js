@@ -177,21 +177,28 @@ function routeData(state, routes, limit) {
     });
 }
 
-function segments(items, allowed, required = []) {
+function mainSegments(items, allowedTargets, allowedSources, required = []) {
     check(Array.isArray(items), 'actions 必须是数组。');
     const used = new Set();
     const result = [];
     for (const row of items) {
-        check(row && allowed.includes(row.to) && !used.has(row.to), 'actions 只能使用允许的对象编号，每个对象一段。');
-        used.add(row.to);
+        check(row && allowedTargets.includes(row.to), 'actions 只能使用允许的对象编号，每个对象一段。');
+        const from = row.from || allowedSources[0];
+        check(allowedSources.includes(from), 'actions 的 from 必须使用允许的主卡编号。');
+        const targetKey = row.to === 'user' ? `${from}:${row.to}` : row.to;
+        check(!used.has(targetKey), '同一副卡本轮只能收到一段主卡行动。');
+        used.add(targetKey);
         const text = narrativeText(row.text);
-        if (text) result.push({ to: row.to, text });
+        if (text) result.push({ to: row.to, from, text });
     }
     check(required.every(id => result.some(action => action.to === id)), '有待回复消息的对象需要各自收到一段回复。');
     return result;
 }
 
-export async function playTurn({ story, main, player, sides, input, generate, signal, progress, onUpdate, historyBudget = 11000, worldRules = {} }) {
+export async function playTurn({ story, main, mainCards = [], player, sides, input, generate, signal, progress, onUpdate, historyBudget = 11000, worldRules = {} }) {
+    const mainMembers = mainCards.length ? mainCards : [{ ...main, key: 'm1' }];
+    const mainByKey = new Map(mainMembers.map(member => [member.key, member]));
+    const mainKeys = mainMembers.map(member => member.key);
     const routes = [{ ...player, id: PLAYER, key: 'user' }, ...sides.map((card, index) => ({ ...card, key: 'c' + (index + 1) }))];
     const byKey = new Map(routes.map(route => [route.key, route]));
     const keyFor = id => routes.find(route => route.id === id)?.key;
@@ -211,6 +218,7 @@ export async function playTurn({ story, main, player, sides, input, generate, si
     };
     const common = () => ({
         main: main.sheet,
+        main_cards: mainMembers.map(member => ({ key: member.key, name: member.name, sheet: member.sheet })),
         at: storyClock(state.minute),
         routes: routeData(state, routes, historyBudget),
         relationship_state: {
@@ -261,12 +269,12 @@ export async function playTurn({ story, main, player, sides, input, generate, si
     };
     progress('正在生成 ' + main.name + ' 的行动');
     const plan = await ask(generate, MAIN_SYSTEM, [
-        '处理玩家新输入并推进剧情。线上互动按对象给出独立行动，空字符串代表无行动。时间来自剧情，未发生时间推移可填 0。当前时间从第 1 天 00:00 起算。',
+        '处理玩家新输入并推进剧情。main_cards 是共同负责本轮规划的主卡组。需要主卡回应玩家时，为每张需要说话的主卡分别写一段 actions，并在 from 中填写主卡编号。主卡之间共享公开剧情，但保持各自口吻和身份。线上互动按对象给出独立行动，空字符串代表无行动。时间来自剧情，未发生时间推移可填 0。当前时间从第 1 天 00:00 起算。',
         '只有实际见面进入线下约会，线上邀约不算。如果开始或结束时间在本轮内，用相对于本轮开始的分钟数。正在约会时保留相同对象，startsAt 填 null，endsAt 为 null 时约会继续。如果本轮无约会，date 填 null。',
         '只要本轮包含约会，actions 只允许约会对象，此处仅写约会内的互动。集中回复要等下一步。在线上时，actions 可写任一对象。',
         'inputKind 为 "message" 时，玩家文本是发给主卡的话。只有纯剧情指令、时间跳转或旁白时填 "narration"；和玩家约会时，玩家写给主卡的台词与动作仍归入双方情节。',
         '关系发展要渐进。熟悉度只在有意义的共同经历后增加。缺点先表现为轻微不适，只有明确触及边界、重复发生且对方拒绝调整时才增加张力。单次最多推进一个主要冲突，不要让所有关系同时吵架。',
-        '格式 {"elapsed":0,"inputKind":"message","date":null,"actions":[{"to":"user","text":"行动或台词"}],"state_updates":[{"to":"user","affinity_delta":0}],"relationship_updates":[{"to":"c1","familiarity_delta":0,"tension_delta":0,"issue":""}]}。date 对象格式 {"with":"c1","startsAt":0,"endsAt":null}。每个 to 使用 routes 中的编号，禁止在 text 里代写其他人的回复。state_updates 只记录本轮感情变化，没有变化就返回空数组。relationship_updates 只记录明确发生的关系变化，没有变化就返回空数组。issue 只写当前最主要的未解决问题。',
+        '格式 {"elapsed":0,"inputKind":"message","date":null,"actions":[{"from":"m1","to":"user","text":"行动或台词"}],"state_updates":[{"to":"user","affinity_delta":0}],"relationship_updates":[{"to":"c1","familiarity_delta":0,"tension_delta":0,"issue":""}]}。from 使用 main_cards 中的主卡编号，to 使用 routes 中的对象编号。date 对象格式 {"with":"c1","startsAt":0,"endsAt":null}。每个 to 使用 routes 中的编号，禁止在 text 里代写其他人的回复。state_updates 只记录本轮感情变化，没有变化就返回空数组。relationship_updates 只记录明确发生的关系变化，没有变化就返回空数组。issue 只写当前最主要的未解决问题。',
     ].join('\n'), { ...common(), relationship_rules: mainRules || null, activeDate: previousKey ?? null, playerInput: input }, value => {
         const elapsed = relativeMinute(value.elapsed, 0, Number.MAX_SAFE_INTEGER - story.minute);
         check(['message', 'narration'].includes(value.inputKind), 'inputKind 必须是 message 或 narration。');
@@ -286,7 +294,7 @@ export async function playTurn({ story, main, player, sides, input, generate, si
             elapsed,
             date,
             inputKind: value.inputKind,
-            actions: segments(value.actions, allowed),
+            actions: mainSegments(value.actions, allowed, mainKeys),
             stateUpdates: parseStateUpdates(value, [...byKey.keys()]),
             relationshipUpdates: parseRelationshipUpdates(value, allowed),
         };
@@ -311,9 +319,10 @@ export async function playTurn({ story, main, player, sides, input, generate, si
         emit(active, 'direction', input, start);
     }
 
-    const sendMain = (actions, minute, handled = []) => actions.map(({ to, text }) => {
+    const sendMain = (actions, minute, handled = []) => actions.map(({ from, to, text }) => {
         const route = byKey.get(to);
-        return emit(route.id, 'main', text, minute, handled.includes(to) ? { handled: true } : {});
+        const source = mainByKey.get(from) ?? mainMembers[0];
+        return emit(route.id, 'main', text, minute, { from: source.id, fromName: source.name, ...(handled.includes(to) ? { handled: true } : {}) });
     });
 
     const sendSide = async (route, action, { from, until, background = false }) => {
@@ -336,6 +345,7 @@ export async function playTurn({ story, main, player, sides, input, generate, si
             },
             history: recent(own, historyBudget),
             latestAction: action?.text ?? null,
+            latestActionFrom: action?.fromName ?? null,
             startsAt: storyClock(start),
             fromOffset: from - start,
             untilOffset: until - start,
@@ -356,11 +366,11 @@ export async function playTurn({ story, main, player, sides, input, generate, si
     const mainWrites = async (eligible, must, instructions, latest) => {
         progress(main.name + ' 正在决定如何接话');
         return ask(generate, MAIN_SYSTEM, '本步骤只写主卡说的话或做的事。' + instructions +
-            '\n格式 {"actions":[{"to":"c1","text":"行动或台词"}],"state_updates":[{"to":"c1","affinity_delta":0}],"relationship_updates":[{"to":"c1","familiarity_delta":0,"tension_delta":0,"issue":""}]}。允许参与的编号在 eligible 中，必须回复的编号在 mustReply 中。无行动可返回 {"actions":[]}。state_updates 和 relationship_updates 没有变化时返回空数组。',
+            '\n格式 {"actions":[{"from":"m1","to":"c1","text":"行动或台词"}],"state_updates":[{"to":"c1","affinity_delta":0}],"relationship_updates":[{"to":"c1","familiarity_delta":0,"tension_delta":0,"issue":""}]}。from 使用 main_cards 中的主卡编号。允许参与的对象编号在 eligible 中，必须回复的编号在 mustReply 中。无行动可返回 {"actions":[]}。state_updates 和 relationship_updates 没有变化时返回空数组。',
         { ...common(), relationship_rules: mainRules || null, eligible, mustReply: must, latest: latest.map(event => ({
             to: keyFor(event.route), text: event.text, time: storyClock(event.minute),
         })) }, value => ({
-            actions: segments(value.actions, eligible, must),
+            actions: mainSegments(value.actions, eligible, mainKeys, must),
             stateUpdates: parseStateUpdates(value, eligible),
             relationshipUpdates: parseRelationshipUpdates(value, eligible),
         }), signal);
