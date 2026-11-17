@@ -216,10 +216,11 @@ function affinityBar(score) {
 
 function statusBlock(turn, player, sides) {
     const state = turn.state ?? { affinity: {}, obsession: null };
-    const routes = [{ id: player.id ?? PLAYER, name: player.name }, ...sides.map(card => ({ id: card.id, name: card.name }))];
+    const identityRows = globalThis.privateRoutesIdentity?.statusRows?.({ state, playerRoute: { id: player.id ?? PLAYER } }) || [{ id: player.id ?? PLAYER, name: player.name, score: Number(state.affinity?.[player.id ?? PLAYER]) || 0 }];
+    const routes = [...identityRows, ...sides.map(card => ({ id: card.id, name: card.name }))];
     const getScore = route => Math.max(0, Math.min(100, Number(state.affinity?.[route.id]) || 0));
     const rows = routes.map(route => {
-        const score = getScore(route);
+        const score = Number.isFinite(Number(route.score)) ? Math.max(0, Math.min(100, Number(route.score))) : getScore(route);
         return `- **${markdownSafe(route.name)}**　\`${affinityBar(score)}\` ${score}/100 · ${affinityStage(score)}`;
     });
     const obsession = state.obsession ? stateLabel(state, state.obsession, routes) : '无';
@@ -229,6 +230,8 @@ function statusBlock(turn, player, sides) {
 function textOfTurn(turn, main, player, sides, includeStatus = true, identityStatus = '') {
     const sections = [];
     const mainMembers = main.members?.length ? main.members : [{ id: main.id, name: main.name }];
+    const identityRows = globalThis.privateRoutesIdentity?.statusRows?.({ state: turn.state, playerRoute: { id: player.id ?? PLAYER } }) || [{ id: player.id ?? PLAYER, name: player.name }];
+    const activeIdentity = identityRows.find(identity => identity.id === (player.id ?? PLAYER)) || identityRows[0];
     const renderSection = (title, events, noAction = '主卡本轮无行为') => {
         const lines = events.map(event => {
             const speaker = event.kind === 'main' ? (event.fromName || main.name) : title;
@@ -240,14 +243,18 @@ function textOfTurn(turn, main, player, sides, includeStatus = true, identitySta
     };
     if (mainMembers.length > 1) {
         for (const member of mainMembers) {
-            const events = turn.events.filter(event => event.route === player.id && event.kind === 'main' && event.from === member.id)
+            const events = turn.events.filter(event => event.route === activeIdentity.id && event.kind === 'main' && event.from === member.id)
                 .sort((a, b) => a.minute - b.minute);
-            renderSection(member.name, events);
+            renderSection(activeIdentity.name + ' · ' + member.name, events);
         }
     } else {
-        const events = turn.events.filter(event => event.route === player.id && ['main', 'side'].includes(event.kind))
+        const events = turn.events.filter(event => event.route === activeIdentity.id && ['main', 'side'].includes(event.kind))
             .sort((a, b) => a.minute - b.minute);
-        renderSection(player.name, events);
+        renderSection(activeIdentity.name, events);
+    }
+    for (const identity of identityRows) {
+        if (identity.id === activeIdentity.id) continue;
+        renderSection(identity.name, []);
     }
     for (const route of sides) {
         const events = turn.events.filter(event => event.route === route.id && ['main', 'side'].includes(event.kind))
@@ -312,7 +319,7 @@ async function prepareIdentity(context, payload) {
 }
 
 function identityStatus(api, payload) {
-    return api?.statusBlock ? api.statusBlock(payload) : '';
+    return '';
 }
 
 function showError(message) {
