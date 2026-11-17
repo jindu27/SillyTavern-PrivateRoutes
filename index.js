@@ -226,7 +226,7 @@ function statusBlock(turn, player, sides) {
     return ['### 团子状态', '', ...rows, '', `心里那个人：**${markdownSafe(obsession)}**`].join('\n');
 }
 
-function textOfTurn(turn, main, player, sides, includeStatus = true) {
+function textOfTurn(turn, main, player, sides, includeStatus = true, identityStatus = '') {
     const sections = [];
     const mainMembers = main.members?.length ? main.members : [{ id: main.id, name: main.name }];
     const renderSection = (title, events, noAction = '主卡本轮无行为') => {
@@ -255,7 +255,10 @@ function textOfTurn(turn, main, player, sides, includeStatus = true) {
         renderSection(route.name, events);
     }
     const body = sections.join('\n\n---\n\n');
-    return includeStatus && main.showStatusBar ? body + '\n\n' + statusBlock(turn, player, sides) : body;
+    const blocks = [];
+    if (includeStatus && main.showStatusBar) blocks.push(statusBlock(turn, player, sides));
+    if (identityStatus) blocks.push(identityStatus);
+    return blocks.length ? body + '\n\n' + blocks.join('\n\n') : body;
 }
 
 function stateLabel(state, routeId, routes) {
@@ -280,7 +283,7 @@ function syncStateVariables(context, state, main, player, sides) {
     local.set('obsession_name', stateLabel(state, state?.obsession, routes));
 }
 
-function renderLivePreview(context, main, player, sides, turn, state) {
+function renderLivePreview(context, main, player, sides, turn, state, identityStatusText = '') {
     const chatElement = document.querySelector('#chat');
     if (!chatElement) return;
     syncStateVariables(context, state, main, player, sides);
@@ -291,7 +294,7 @@ function renderLivePreview(context, main, player, sides, turn, state) {
         preview.className = 'mes private-routes-live';
         chatElement.append(preview);
     }
-    const body = textOfTurn(turn, main, player, sides);
+    const body = textOfTurn(turn, main, player, sides, true, identityStatusText);
     preview.innerHTML = '<div class="private-routes-live-label">正在生成多线回复…</div><div class="private-routes-live-content"></div>';
     const content = preview.querySelector('.private-routes-live-content');
     content.innerHTML = context.messageFormatting(body, main.name, false, false, -1, {}, false);
@@ -299,6 +302,16 @@ function renderLivePreview(context, main, player, sides, turn, state) {
 
 function removeLivePreview() {
     document.querySelector('#private-routes-live')?.remove();
+}
+
+async function prepareIdentity(context, payload) {
+    const api = globalThis.privateRoutesIdentity;
+    if (!api?.prepareTurn) return null;
+    return await api.prepareTurn({ context, ...payload });
+}
+
+function identityStatus(api, payload) {
+    return api?.statusBlock ? api.statusBlock(payload) : '';
 }
 
 function showError(message) {
@@ -345,7 +358,9 @@ async function send({ regenerate = false } = {}) {
     if (document.querySelector('#file_form_input')?.files?.length || document.querySelector('#embed_file_input')?.files?.length) {
         return showError('多线群聊目前支持文本。请先移除附件。');
     }
-    const player = { name: context.name1 };
+    const identityApi = globalThis.privateRoutesIdentity;
+    const identity = await prepareIdentity(context, { chatId, group, input, chat: checkpoint, playerName: context.name1 });
+    const player = identity?.player ?? { name: context.name1 };
     const main = mainGroup(selectedMainCards, player.name);
     const sides = cards.filter(card => !selectedMainIds.includes(card.avatar)).map(card => roleSheet(card, main.name));
     const before = textarea.value;
@@ -355,15 +370,16 @@ async function send({ regenerate = false } = {}) {
     try {
         const storyMetadata = regenerate ? { ...context.chatMetadata, [STATE_KEY]: null } : context.chatMetadata;
         const story = readStory(checkpoint, main.id, storyMetadata);
+        if (identity?.stateOverride) story.state = identity.stateOverride;
         const worldRules = await loadWorldRules(context, config.worldbook, main, sides, input, checkpoint, story);
         const turn = await playTurn({
-            story, main, mainCards: main.members, player, sides, input, worldRules, signal: controller.signal,
+            story, main, mainCards: main.members, player, playerRoute: identity?.playerRoute, sides, input, worldRules, signal: controller.signal,
             progress(message) {
                 status = message;
                 render();
             },
             async onUpdate({ turn: liveTurn, state }) {
-                renderLivePreview(context, main, player, sides, liveTurn, state);
+                renderLivePreview(context, main, player, sides, liveTurn, state, identityStatus(identityApi, { state, playerRoute: identity?.playerRoute }));
             },
             historyBudget: Math.max(1500, Math.min(18000, Math.round((context.maxContext || 4096) * 1.65))),
             async generate(systemPrompt, prompt) {
@@ -387,10 +403,11 @@ async function send({ regenerate = false } = {}) {
         removeLivePreview();
         const time = new Date().toISOString();
         const userMessage = { name: player.name, is_user: true, is_system: false, mes: input, send_date: time, extra: { [INPUT_KEY]: true } };
+        if (identityApi?.commitTurn) await identityApi.commitTurn({ context, chatId, turn, playerRoute: identity?.playerRoute });
         const aiMessage = {
             name: main.name, is_user: false, is_system: false, send_date: time,
             force_avatar: context.getThumbnailUrl('avatar', main.avatar), original_avatar: main.avatar,
-            mes: textOfTurn(turn, main, player, sides), extra: { [TURN_KEY]: turn },
+            mes: textOfTurn(turn, main, player, sides, true, identityStatus(identityApi, { state: turn.state, playerRoute: identity?.playerRoute })), extra: { [TURN_KEY]: turn },
         };
         // Pin the destination and its integrity header before awaiting I/O.
         const metadata = { ...context.chatMetadata, [STATE_KEY]: turn.state, tainted: true };

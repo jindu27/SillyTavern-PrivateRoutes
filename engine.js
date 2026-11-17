@@ -63,22 +63,24 @@ function normalizeState(value, routes) {
         ['aff_lushi', routes.find(route => route.name === '陆时')?.id],
     ]);
     const source = state.affinity && typeof state.affinity === 'object' ? state.affinity : state;
+    const maxFinite = values => values.length ? Math.max(...values) : Number.NaN;
     for (const route of routes) {
-        let score = Number(source[route.id]);
+        const stateIds = Array.isArray(route.stateIds) && route.stateIds.length ? route.stateIds : [route.id];
+        let score = maxFinite(stateIds.map(id => Number(source[id])).filter(Number.isFinite));
         if (!Number.isFinite(score)) {
             for (const [key, id] of oldKeys) {
-                if (id === route.id && Number.isFinite(Number(source[key]))) {
+                if (stateIds.includes(id) && Number.isFinite(Number(source[key]))) {
                     score = Number(source[key]);
                     break;
                 }
             }
         }
         affinity[route.id] = Math.max(0, Math.min(100, Math.round(Number.isFinite(score) ? score : 0)));
-        const familiarValue = Number(state.familiarity?.[route.id]);
+        const familiarValue = maxFinite(stateIds.map(id => Number(state.familiarity?.[id])).filter(Number.isFinite));
         familiarity[route.id] = Math.max(0, Math.min(100, Math.round(Number.isFinite(familiarValue) ? familiarValue : 0)));
-        const tensionValue = Number(state.tension?.[route.id]);
+        const tensionValue = maxFinite(stateIds.map(id => Number(state.tension?.[id])).filter(Number.isFinite));
         tension[route.id] = Math.max(0, Math.min(4, Math.round(Number.isFinite(tensionValue) ? tensionValue : 0)));
-        const previousFriction = state.friction?.[route.id];
+        const previousFriction = stateIds.map(id => state.friction?.[id]).find(value => value && typeof value === 'object');
         friction[route.id] = previousFriction && typeof previousFriction === 'object'
             ? {
                 issue: typeof previousFriction.issue === 'string' ? previousFriction.issue.slice(0, 80) : '',
@@ -155,10 +157,11 @@ function recent(events, limit) {
     return result;
 }
 
-function pending(events, id) {
+function pending(events, ids) {
+    const routeIds = Array.isArray(ids) ? ids : [ids];
     const result = [];
     for (const event of events) {
-        if (event.route !== id) continue;
+        if (!routeIds.includes(event.route)) continue;
         if (event.handled) result.length = 0;
         if (event.pending) result.push(event);
     }
@@ -167,12 +170,14 @@ function pending(events, id) {
 
 function routeData(state, routes, limit) {
     return routes.map(({ id, key, name }) => {
-        const events = state.events.filter(event => event.route === id);
+        const route = routes.find(candidate => candidate.id === id);
+        const historyIds = route?.historyIds ?? [id];
+        const events = state.events.filter(event => historyIds.includes(event.route));
         return {
             to: key,
             name,
             history: recent(events, limit / Math.max(routes.length, 1)),
-            waiting: pending(events, id).map(event => ({ time: storyClock(event.minute), text: event.text })),
+            waiting: pending(events, historyIds).map(event => ({ time: storyClock(event.minute), text: event.text })),
         };
     });
 }
@@ -195,11 +200,18 @@ function mainSegments(items, allowedTargets, allowedSources, required = []) {
     return result;
 }
 
-export async function playTurn({ story, main, mainCards = [], player, sides, input, generate, signal, progress, onUpdate, historyBudget = 11000, worldRules = {} }) {
+export async function playTurn({ story, main, mainCards = [], player, playerRoute: suppliedPlayerRoute = null, sides, input, generate, signal, progress, onUpdate, historyBudget = 11000, worldRules = {} }) {
     const mainMembers = mainCards.length ? mainCards : [{ ...main, key: 'm1' }];
     const mainByKey = new Map(mainMembers.map(member => [member.key, member]));
     const mainKeys = mainMembers.map(member => member.key);
-    const routes = [{ ...player, id: PLAYER, key: 'user' }, ...sides.map((card, index) => ({ ...card, key: 'c' + (index + 1) }))];
+    const playerRoute = suppliedPlayerRoute ?? player.route ?? {};
+    const routes = [{
+        ...player,
+        id: playerRoute.id ?? PLAYER,
+        key: 'user',
+        historyIds: playerRoute.historyIds,
+        stateIds: playerRoute.stateIds,
+    }, ...sides.map((card, index) => ({ ...card, key: 'c' + (index + 1) }))];
     const byKey = new Map(routes.map(route => [route.key, route]));
     const keyFor = id => routes.find(route => route.id === id)?.key;
     const previousDate = story.date;
@@ -311,10 +323,10 @@ export async function playTurn({ story, main, mainCards = [], player, sides, inp
     turn.focus = date?.id ?? null;
     turn.date = state.date;
     if (plan.inputKind === 'message') {
-        const queued = date && date.id !== PLAYER;
-        emit(PLAYER, 'user', input, start, queued ? { pending: true } : {});
+        const queued = date && date.id !== routes[0].id;
+        emit(routes[0].id, 'user', input, start, queued ? { pending: true } : {});
     } else {
-        const active = date?.id ?? PLAYER;
+        const active = date?.id ?? routes[0].id;
         // Scene directions are only provided to the main model, never to a side.
         emit(active, 'direction', input, start);
     }
@@ -397,7 +409,7 @@ export async function playTurn({ story, main, mainCards = [], player, sides, inp
     }
 
     if (!state.date) {
-        const ready = routes.filter(route => pending(state.events, route.id).length);
+        const ready = routes.filter(route => pending(state.events, route.historyIds ?? [route.id]).length);
         if (ready.length) {
             const keys = ready.map(route => route.key);
             const replies = await mainWrites(keys, keys, '约会已结束或已有待补回的来信。在同一次输出中按对象分别集中回复待处理消息。', deferred);
