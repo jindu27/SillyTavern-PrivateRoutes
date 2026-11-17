@@ -368,18 +368,18 @@ async function send({ regenerate = false } = {}) {
     if (document.querySelector('#file_form_input')?.files?.length || document.querySelector('#embed_file_input')?.files?.length) {
         return showError('多线群聊目前支持文本。请先移除附件。');
     }
-    const identityApi = globalThis.privateRoutesIdentity;
-    const identity = await prepareIdentity(context, { chatId, group, input, chat: checkpoint, playerName: context.name1 });
-    const player = identity?.player
-        ? { ...identity.player, id: identity.playerRoute?.id }
-        : { name: context.name1, id: PLAYER };
-    const main = mainGroup(selectedMainCards, player.name);
-    const sides = cards.filter(card => !selectedMainIds.includes(card.avatar)).map(card => roleSheet(card, main.name));
     const before = textarea.value;
     const controller = new AbortController();
     running = { controller, chatId, groupId: group.id, regenerate };
     render();
     try {
+        const identityApi = globalThis.privateRoutesIdentity;
+        const identity = await prepareIdentity(context, { chatId, group, input, chat: checkpoint, playerName: context.name1 });
+        const player = identity?.player
+            ? { ...identity.player, id: identity.playerRoute?.id }
+            : { name: context.name1, id: PLAYER };
+        const main = mainGroup(selectedMainCards, player.name);
+        const sides = cards.filter(card => !selectedMainIds.includes(card.avatar)).map(card => roleSheet(card, main.name));
         const storyMetadata = regenerate ? { ...context.chatMetadata, [STATE_KEY]: null } : context.chatMetadata;
         const story = readStory(checkpoint, main.id, storyMetadata);
         if (identity?.stateOverride) story.state = identity.stateOverride;
