@@ -1,9 +1,15 @@
 export const TURN_KEY = 'privateRoutesTurn';
 export const STATE_KEY = 'privateRoutesState';
 export const PLAYER = '$user';
-const MAIN_SYSTEM = '你扮演主卡。使用与当前对话相同的语言，遵守角色设定，保持每条关系的连续性。你知道所有分线，但一般不把另一条线的内容泄露给当事人，除非剧情中的主卡有意转述。不要替其他角色说话或决定行动，不要让玩家的输入直接作用于副卡。只输出要求的 JSON 对象。状态数据放在 state_updates 字段中，不要把 <state>、【团子状态】、HTML 或状态栏放进任何 actions.text。';
+const MAIN_SYSTEM = '你扮演主卡。使用与当前对话相同的语言，遵守角色设定，保持每条关系的连续性。你知道所有分线，但一般不把另一条线的内容泄露给当事人，除非剧情中的主卡有意转述。不要替其他角色说话或决定行动。普通玩家输入不直接作用于副卡；只有玩家明确点名要求时，才通过 side_directives 传递导演指令。只输出要求的 JSON 对象。状态数据放在 state_updates 字段中，不要把 <state>、【团子状态】、HTML 或状态栏放进任何 actions.text。';
 const SIDE_SYSTEM = '你只扮演当前副卡，依据这条关系的经历和自己的人设独立行动。只写本角色实际对主卡做的动作或说的话。你只了解已提供给你的内容。只输出要求的 JSON 对象。';
 const MAX_TEXT = 6500;
+const STYLE_GUARD = [
+    '【分层约束】',
+    '上一段是用户选择的酒馆预设文风，仅用于约束叙事内容，包括人称、语言、句式、节奏、描写方式和角色口吻。',
+    '文风层不得改变本任务的角色边界、私线隔离、字段名称、数据类型或外层 JSON 结构。',
+    '所有风格要求只作用于 actions[].text 和 messages[].text 等内容字段，不得输出 JSON 之外的说明。',
+].join('\n');
 
 function decode(raw) {
     let text = String(raw).trim();
@@ -16,6 +22,12 @@ function decode(raw) {
 
 function check(condition, reason) {
     if (!condition) throw new Error(reason);
+}
+
+function layeredSystem(system, stylePrompt) {
+    const style = String(stylePrompt || '').trim();
+    if (!style) return system;
+    return [system, '【预设文风】', style, STYLE_GUARD].join('\n\n');
 }
 
 async function ask(generate, system, instructions, data, validate, signal) {
@@ -158,6 +170,21 @@ function parseRelationshipUpdates(value, allowed) {
     });
 }
 
+function parseSideDirectives(value, routes) {
+    if (value.side_directives === undefined) return [];
+    check(Array.isArray(value.side_directives), 'side_directives 必须是数组。');
+    const allowed = new Set(routes.slice(1).map(route => route.key));
+    const used = new Set();
+    return value.side_directives.map(item => {
+        check(item && typeof item === 'object', 'side_directives 中缺少指令对象。');
+        check(allowed.has(item.to) && !used.has(item.to), 'side_directives 只能指定一个存在的副卡，且每张副卡一条。');
+        used.add(item.to);
+        const instruction = String(item.instruction || '').trim();
+        check(instruction && instruction.length <= 500, '副卡导演指令必须是 1 到 500 字的文本。');
+        return { to: item.to, instruction };
+    });
+}
+
 export function storyClock(minute) {
     const day = Math.floor(minute / 1440) + 1;
     const hour = String(Math.floor((minute % 1440) / 60)).padStart(2, '0');
@@ -231,7 +258,7 @@ function mainSegments(items, allowedTargets, allowedSources, required = []) {
     return result;
 }
 
-export async function playTurn({ story, main, mainCards = [], player, playerRoute: suppliedPlayerRoute = null, sides, input, generate, signal, progress, onUpdate, historyBudget = 11000, worldRules = {} }) {
+export async function playTurn({ story, main, mainCards = [], player, playerRoute: suppliedPlayerRoute = null, sides, input, generate, signal, progress, onUpdate, historyBudget = 11000, worldRules = {}, stylePrompt = '' }) {
     const mainMembers = mainCards.length ? mainCards : [{ ...main, key: 'm1' }];
     const mainByKey = new Map(mainMembers.map(member => [member.key, member]));
     const mainKeys = mainMembers.map(member => member.key);
@@ -332,13 +359,16 @@ export async function playTurn({ story, main, mainCards = [], player, playerRout
         if (onUpdate) await onUpdate({ turn, state: cloneState(routeState) });
     };
     progress('正在生成 ' + main.name + ' 的行动');
-    const plan = await ask(generate, MAIN_SYSTEM, [
+    const mainSystem = layeredSystem(MAIN_SYSTEM, stylePrompt);
+    const sideSystem = layeredSystem(SIDE_SYSTEM, stylePrompt);
+    const plan = await ask(generate, mainSystem, [
         '处理玩家新输入并推进剧情。main_cards 是共同负责本轮规划的主卡组。需要主卡回应玩家时，为每张需要说话的主卡分别写一段 actions，并在 from 中填写主卡编号。主卡之间共享公开剧情，但保持各自口吻和身份。线上互动按对象给出独立行动，空字符串代表无行动。时间来自剧情，未发生时间推移可填 0。当前时间从第 1 天 00:00 起算。',
         '只有实际见面进入线下约会，线上邀约不算。如果开始或结束时间在本轮内，用相对于本轮开始的分钟数。正在约会时保留相同对象，startsAt 填 null，endsAt 为 null 时约会继续。如果本轮无约会，date 填 null。',
         '只要本轮包含约会，actions 只允许约会对象，此处仅写约会内的互动。集中回复要等下一步。在线上时，actions 可写任一对象。',
         'inputKind 为 "message" 时，玩家文本是发给主卡的话。只有纯剧情指令、时间跳转或旁白时填 "narration"；和玩家约会时，玩家写给主卡的台词与动作仍归入双方情节。',
         '关系状态为 new 时，角色卡中的初始场景只代表刚认识阶段。关系状态为 ongoing 时，以聊天历史、世界书和 relationship_state 为准，不要把角色重新写成刚加好友。关系发展要渐进。熟悉度只在有意义的共同经历后增加。缺点先表现为轻微不适，只有明确触及边界、重复发生且对方拒绝调整时才增加张力。单次最多推进一个主要冲突，不要让所有关系同时吵架。',
-        '格式 {"elapsed":0,"inputKind":"message","date":null,"actions":[{"from":"m1","to":"user","text":"行动或台词"}],"state_updates":[{"to":"user","affinity_delta":0}],"relationship_updates":[{"to":"c1","familiarity_delta":0,"tension_delta":0,"issue":"","resolve_issue":""}]}。from 使用 main_cards 中的主卡编号，to 使用 routes 中的对象编号。date 对象格式 {"with":"c1","startsAt":0,"endsAt":null}。每个 to 使用 routes 中的编号，禁止在 text 里代写其他人的回复。state_updates 只记录本轮感情变化，没有变化就返回空数组。relationship_updates 只记录明确发生的关系变化，没有变化就返回空数组。issue 只记录当前最主要的未解决问题，resolve_issue 只用于明确解决已有问题。',
+        '只有当玩家明确要求某张副卡说话、行动或改变本轮表现时，才填写 side_directives。例如“让×做×”“@×做×”“要求×回应”。普通愿望、假设、剧情旁白和没有点名的要求不要生成导演指令，也不要从普通剧情猜测副卡应该服从什么。导演指令不是玩家对副卡发送的聊天消息，只有在目标副卡自己的生成步骤中提供。',
+        '格式 {"elapsed":0,"inputKind":"message","date":null,"actions":[{"from":"m1","to":"user","text":"行动或台词"}],"side_directives":[{"to":"c1","instruction":"明确要求该副卡执行的本轮导演指令"}],"state_updates":[{"to":"user","affinity_delta":0}],"relationship_updates":[{"to":"c1","familiarity_delta":0,"tension_delta":0,"issue":"","resolve_issue":""}]}。from 使用 main_cards 中的主卡编号，to 使用 routes 中的对象编号。没有明确副卡要求时 side_directives 返回空数组。date 对象格式 {"with":"c1","startsAt":0,"endsAt":null}。每个 to 使用 routes 中的编号，禁止在 text 里代写其他人的回复。state_updates 只记录本轮感情变化，没有变化就返回空数组。relationship_updates 只记录明确发生的关系变化，没有变化也返回空数组。issue 只记录当前最主要的未解决问题，resolve_issue 只用于明确解决已有问题。',
     ].join('\n'), { ...common(), relationship_rules: mainRules || null, activeDate: previousKey ?? null, playerInput: input }, value => {
         const elapsed = relativeMinute(value.elapsed, 0, Number.MAX_SAFE_INTEGER - story.minute);
         check(['message', 'narration'].includes(value.inputKind), 'inputKind 必须是 message 或 narration。');
@@ -359,6 +389,7 @@ export async function playTurn({ story, main, mainCards = [], player, playerRout
             date,
             inputKind: value.inputKind,
             actions: mainSegments(value.actions, allowed, mainKeys),
+            sideDirectives: parseSideDirectives(value, routes),
             stateUpdates: parseStateUpdates(value, [...byKey.keys()]),
             relationshipUpdates: parseRelationshipUpdates(value, allowed),
         };
@@ -389,12 +420,14 @@ export async function playTurn({ story, main, mainCards = [], player, playerRout
         return emit(route.id, 'main', text, minute, { from: source.id, fromName: source.name, ...(handled.includes(to) ? { handled: true } : {}) });
     });
 
-    const sendSide = async (route, action, { from, until, background = false }) => {
+    const sendSide = async (route, action, { from, until, background = false, directorInstruction = '' }) => {
         progress(background ? route.name + ' 正在独立行动' : '等待 ' + route.name + ' 回应');
         const own = state.events.filter(event => event.route === route.id && event.kind !== 'direction');
-        const messages = await ask(generate, SIDE_SYSTEM, [
+        const requiredReply = Boolean(action || directorInstruction);
+        const messages = await ask(generate, sideSystem, [
             '资料中的 relationship_rules 是当前世界书对关系发展、冲突、修复和正向推进的规则。只使用与自己这条关系有关的部分。relationship_state 是当前关系模式、熟悉度、阶段、张力和未解决问题，不要把它当成必须立即爆发的剧情。关系模式为 new 时尊重刚认识设定，ongoing 时以历史和状态为准。',
-            action ? '主卡已对你采取行动，你必须回应一次。'
+            directorInstruction ? '玩家用导演口吻明确要求你执行 director_instruction。你必须在保持角色身份、语言和已有私线事实的前提下执行，但不要把它当成主卡说过的台词，也不要泄露其他私线。'
+                : action ? '主卡已对你采取行动，你必须回应一次。'
                 : background ? '约会期间默认跳过本轮，不主动发消息。只有这段时间发生了明确且重要、不能等到约会结束再说的事件时，才发一条待处理消息。时间继续经过，但不要为了填满时间而制造剧情。'
                     : '你可以根据自己的经历主动联系主卡，或跳过本轮。最多一条。',
             '返回 {"messages":[{"at":0,"text":"你的实际台词或动作"}]}。at 是相对于本轮起点的分钟数，范围 [fromOffset, untilOffset]；请按时间从早到晚输出。无动作时返回 {"messages":[]}。',
@@ -413,12 +446,13 @@ export async function playTurn({ story, main, mainCards = [], player, playerRout
             history: recent(own, historyBudget),
             latestAction: action?.text ?? null,
             latestActionFrom: action?.fromName ?? null,
+            director_instruction: directorInstruction || null,
             startsAt: storyClock(start),
             fromOffset: from - start,
             untilOffset: until - start,
         }, value => {
             check(Array.isArray(value.messages) && value.messages.length <= 1, 'messages 数组的条数超出本次允许范围。');
-            check(!action || value.messages.length === 1, '被点到时 messages 必须有一条回复。');
+            check(!requiredReply || value.messages.length === 1, '被主卡点到或被导演要求时必须有一条回复。');
             return value.messages.map(item => {
                 check(item && typeof item === 'object', 'messages 中缺少消息对象。');
                 return {
@@ -432,7 +466,7 @@ export async function playTurn({ story, main, mainCards = [], player, playerRout
 
     const mainWrites = async (eligible, must, instructions, latest) => {
         progress(main.name + ' 正在决定如何接话');
-        return ask(generate, MAIN_SYSTEM, '本步骤只写主卡说的话或做的事。' + instructions +
+        return ask(generate, mainSystem, '本步骤只写主卡说的话或做的事。' + instructions +
             '\n格式 {"actions":[{"from":"m1","to":"c1","text":"行动或台词"}],"state_updates":[{"to":"c1","affinity_delta":0}],"relationship_updates":[{"to":"c1","familiarity_delta":0,"tension_delta":0,"issue":"","resolve_issue":""}]}。from 使用 main_cards 中的主卡编号。允许参与的对象编号在 eligible 中，必须回复的编号在 mustReply 中。无行动可返回 {"actions":[]}。state_updates 和 relationship_updates 没有变化时返回空数组。',
         { ...common(), relationship_rules: mainRules || null, eligible, mustReply: must, latest: latest.map(event => ({
             to: keyFor(event.route), text: event.text, time: storyClock(event.minute),
@@ -446,18 +480,26 @@ export async function playTurn({ story, main, mainCards = [], player, playerRout
     const responses = [];
     const deferred = [];
     const actions = sendMain(plan.actions, date ? start + date.end : end);
+    const directiveFor = route => plan.sideDirectives.find(item => item.to === route.key)?.instruction || '';
     await publish();
     for (const route of routes.slice(1)) {
         const action = actions.find(entry => entry.route === route.id);
+        const directorInstruction = directiveFor(route);
         if (date && date.id !== route.id) {
-            if (date.end > date.start) {
-                deferred.push(...await sendSide(route, null, { from: start + date.start, until: start + date.end, background: true }));
+            if (directorInstruction || date.end > date.start) {
+                deferred.push(...await sendSide(route, null, {
+                    from: start + date.start,
+                    until: start + date.end,
+                    background: true,
+                    directorInstruction,
+                }));
                 await publish();
             }
         } else {
             responses.push(...await sendSide(route, action, {
                 from: action?.minute ?? (date ? start + date.start : end),
                 until: date ? start + date.end : end,
+                directorInstruction,
             }));
             await publish();
         }
