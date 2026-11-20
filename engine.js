@@ -4,12 +4,6 @@ export const PLAYER = '$user';
 const MAIN_SYSTEM = '你扮演主卡。使用与当前对话相同的语言，遵守角色设定，保持每条关系的连续性。你知道所有分线，但一般不把另一条线的内容泄露给当事人，除非剧情中的主卡有意转述。不要替其他角色说话或决定行动。普通玩家输入不直接作用于副卡；只有玩家明确点名要求时，才通过 side_directives 传递导演指令。只输出要求的 JSON 对象。状态数据放在 state_updates 字段中，不要把 <state>、【团子状态】、HTML 或状态栏放进任何 actions.text。';
 const SIDE_SYSTEM = '你只扮演当前副卡，依据这条关系的经历和自己的人设独立行动。只写本角色实际对主卡做的动作或说的话。你只了解已提供给你的内容。只输出要求的 JSON 对象。';
 const MAX_TEXT = 6500;
-const STYLE_GUARD = [
-    '【分层约束】',
-    '上一段是用户选择的酒馆预设文风，仅用于约束叙事内容，包括人称、语言、句式、节奏、描写方式和角色口吻。',
-    '文风层不得改变本任务的角色边界、私线隔离、字段名称、数据类型或外层 JSON 结构。',
-    '所有风格要求只作用于 actions[].text 和 messages[].text 等内容字段，不得输出 JSON 之外的说明。',
-].join('\n');
 
 function decode(raw) {
     let text = String(raw).trim();
@@ -24,17 +18,11 @@ function check(condition, reason) {
     if (!condition) throw new Error(reason);
 }
 
-function layeredSystem(system, stylePrompt) {
-    const style = String(stylePrompt || '').trim();
-    if (!style) return system;
-    return [system, '【预设文风】', style, STYLE_GUARD].join('\n\n');
-}
-
-async function ask(generate, system, instructions, data, validate, signal) {
+async function ask(generate, system, instructions, data, validate, signal, roleContext = {}) {
     let hint = '';
     for (let attempt = 0; attempt < 2; attempt++) {
         signal.throwIfAborted();
-        const raw = await generate(system, instructions + hint + '\n\n本次资料（JSON）\n' + JSON.stringify(data));
+        const raw = await generate(system, instructions + hint + '\n\n本次资料（JSON）\n' + JSON.stringify(data), roleContext);
         signal.throwIfAborted();
         try {
             return validate(decode(raw));
@@ -258,7 +246,7 @@ function mainSegments(items, allowedTargets, allowedSources, required = []) {
     return result;
 }
 
-export async function playTurn({ story, main, mainCards = [], player, playerRoute: suppliedPlayerRoute = null, sides, input, generate, signal, progress, onUpdate, historyBudget = 11000, worldRules = {}, stylePrompt = '' }) {
+export async function playTurn({ story, main, mainCards = [], player, playerRoute: suppliedPlayerRoute = null, sides, input, generate, signal, progress, onUpdate, historyBudget = 11000, worldRules = {} }) {
     const mainMembers = mainCards.length ? mainCards : [{ ...main, key: 'm1' }];
     const mainByKey = new Map(mainMembers.map(member => [member.key, member]));
     const mainKeys = mainMembers.map(member => member.key);
@@ -359,9 +347,7 @@ export async function playTurn({ story, main, mainCards = [], player, playerRout
         if (onUpdate) await onUpdate({ turn, state: cloneState(routeState) });
     };
     progress('正在生成 ' + main.name + ' 的行动');
-    const mainSystem = layeredSystem(MAIN_SYSTEM, stylePrompt);
-    const sideSystem = layeredSystem(SIDE_SYSTEM, stylePrompt);
-    const plan = await ask(generate, mainSystem, [
+    const plan = await ask(generate, MAIN_SYSTEM, [
         '处理玩家新输入并推进剧情。main_cards 是共同负责本轮规划的主卡组。需要主卡回应玩家时，为每张需要说话的主卡分别写一段 actions，并在 from 中填写主卡编号。主卡之间共享公开剧情，但保持各自口吻和身份。线上互动按对象给出独立行动，空字符串代表无行动。时间来自剧情，未发生时间推移可填 0。当前时间从第 1 天 00:00 起算。',
         '只有实际见面进入线下约会，线上邀约不算。如果开始或结束时间在本轮内，用相对于本轮开始的分钟数。正在约会时保留相同对象，startsAt 填 null，endsAt 为 null 时约会继续。如果本轮无约会，date 填 null。',
         '只要本轮包含约会，actions 只允许约会对象，此处仅写约会内的互动。集中回复要等下一步。在线上时，actions 可写任一对象。',
@@ -393,7 +379,7 @@ export async function playTurn({ story, main, mainCards = [], player, playerRout
             stateUpdates: parseStateUpdates(value, [...byKey.keys()]),
             relationshipUpdates: parseRelationshipUpdates(value, allowed),
         };
-    }, signal);
+    }, signal, { charName: main.name, userName: player.name });
 
     const start = story.minute;
     const end = start + plan.elapsed;
@@ -424,7 +410,7 @@ export async function playTurn({ story, main, mainCards = [], player, playerRout
         progress(background ? route.name + ' 正在独立行动' : '等待 ' + route.name + ' 回应');
         const own = state.events.filter(event => event.route === route.id && event.kind !== 'direction');
         const requiredReply = Boolean(action || directorInstruction);
-        const messages = await ask(generate, sideSystem, [
+        const messages = await ask(generate, SIDE_SYSTEM, [
             '资料中的 relationship_rules 是当前世界书对关系发展、冲突、修复和正向推进的规则。只使用与自己这条关系有关的部分。relationship_state 是当前关系模式、熟悉度、阶段、张力和未解决问题，不要把它当成必须立即爆发的剧情。关系模式为 new 时尊重刚认识设定，ongoing 时以历史和状态为准。',
             directorInstruction ? '玩家用导演口吻明确要求你执行 director_instruction。你必须在保持角色身份、语言和已有私线事实的前提下执行，但不要把它当成主卡说过的台词，也不要泄露其他私线。'
                 : action ? '主卡已对你采取行动，你必须回应一次。'
@@ -460,13 +446,13 @@ export async function playTurn({ story, main, mainCards = [], player, playerRout
                     minute: start + relativeMinute(item.at, from - start, until - start),
                 };
             }).sort((a, b) => a.minute - b.minute);
-        }, signal);
+        }, signal, { charName: route.name, userName: player.name });
         return messages.map(message => emit(route.id, 'side', message.text, message.minute, background ? { pending: true } : {}));
     };
 
     const mainWrites = async (eligible, must, instructions, latest) => {
         progress(main.name + ' 正在决定如何接话');
-        return ask(generate, mainSystem, '本步骤只写主卡说的话或做的事。' + instructions +
+        return ask(generate, MAIN_SYSTEM, '本步骤只写主卡说的话或做的事。' + instructions +
             '\n格式 {"actions":[{"from":"m1","to":"c1","text":"行动或台词"}],"state_updates":[{"to":"c1","affinity_delta":0}],"relationship_updates":[{"to":"c1","familiarity_delta":0,"tension_delta":0,"issue":"","resolve_issue":""}]}。from 使用 main_cards 中的主卡编号。允许参与的对象编号在 eligible 中，必须回复的编号在 mustReply 中。无行动可返回 {"actions":[]}。state_updates 和 relationship_updates 没有变化时返回空数组。',
         { ...common(), relationship_rules: mainRules || null, eligible, mustReply: must, latest: latest.map(event => ({
             to: keyFor(event.route), text: event.text, time: storyClock(event.minute),
@@ -474,7 +460,7 @@ export async function playTurn({ story, main, mainCards = [], player, playerRout
             actions: mainSegments(value.actions, eligible, mainKeys, must),
             stateUpdates: parseStateUpdates(value, eligible),
             relationshipUpdates: parseRelationshipUpdates(value, eligible),
-        }), signal);
+        }), signal, { charName: main.name, userName: player.name });
     };
 
     const responses = [];

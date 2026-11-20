@@ -1,5 +1,6 @@
 import { shouldSendOnEnter } from '/scripts/RossAscends-mods.js';
 import { PLAYER, STATE_KEY, TURN_KEY, playTurn, readStory, storyClock } from './engine.js';
+import { buildPresetMessages, PRESET_LAYER_GUARD } from './preset.js';
 
 const SETTINGS_KEY = 'privateRoutes';
 const INPUT_KEY = 'privateRoutesInput';
@@ -24,10 +25,9 @@ function current(context = getContext()) {
     const group = context.groups.find(item => String(item.id) === String(context.groupId));
     if (!group || !context.chatId) return {};
     const groups = context.extensionSettings[SETTINGS_KEY] ??= {};
-    const config = groups[String(group.id)] ??= { enabled: false, main: [], worldbook: [], stylePrompt: '' };
+    const config = groups[String(group.id)] ??= { enabled: false, main: [], worldbook: [] };
     config.main = asList(config.main);
     config.worldbook = asList(config.worldbook);
-    config.stylePrompt = typeof config.stylePrompt === 'string' ? config.stylePrompt : '';
     const cards = group.members.map(id => context.characters.find(card => card.avatar === id)).filter(Boolean);
     return { group, config, cards, chatId: context.chatId };
 }
@@ -127,9 +127,6 @@ function render() {
     ui.main.disabled = Boolean(running);
     ui.worldbook.hidden = !config.enabled;
     ui.worldbook.disabled = Boolean(running);
-    ui.style.hidden = !config.enabled;
-    ui.style.disabled = Boolean(running);
-    if (ui.style.value !== config.stylePrompt) ui.style.value = config.stylePrompt;
     ui.status.hidden = !config.enabled;
     if (!config.enabled) return;
     disableNativeAutoMode();
@@ -414,12 +411,32 @@ async function send({ regenerate = false } = {}) {
                 renderLivePreview(context, main, player, sides, liveTurn, state, identityStatus(identityApi, { state, playerRoute: identity?.playerRoute }));
             },
             historyBudget: Math.max(1500, Math.min(18000, Math.round((context.maxContext || 4096) * 1.65))),
-            stylePrompt: config.stylePrompt,
-            async generate(systemPrompt, prompt) {
+            async generate(systemPrompt, prompt, roleContext = {}) {
                 // generateRawData does not include the active chat. Escape unknown macros in supplied data
                 // so core SillyTavern does not expand them against the ambient group.
                 const safe = text => text.replaceAll('{{', '{\u200B{');
-                const data = await context.generateRawData({ systemPrompt: safe(systemPrompt), prompt: safe(prompt), api: context.mainApi });
+                const presetMessages = buildPresetMessages({
+                    settings: context.chatCompletionSettings,
+                    characterId: context.characterId,
+                    charName: roleContext.charName || main.name,
+                    userName: roleContext.userName || player.name,
+                    substitute: typeof context.substituteParams === 'function'
+                        ? (content, options) => context.substituteParams(content, options)
+                        : null,
+                });
+                const taskPrompt = [
+                    presetMessages.length ? PRESET_LAYER_GUARD : '',
+                    '【本轮结构化任务】',
+                    prompt,
+                ].filter(Boolean).join('\n\n');
+                const requestPrompt = presetMessages.length
+                    ? [...presetMessages, { role: 'user', content: safe(taskPrompt) }]
+                    : safe(taskPrompt);
+                const data = await context.generateRawData({
+                    systemPrompt: safe(systemPrompt),
+                    prompt: requestPrompt,
+                    api: context.mainApi,
+                });
                 return context.extractMessageFromData(data, context.mainApi);
             },
         });
@@ -532,17 +549,12 @@ function initialize() {
     root.innerHTML = '<label><input type="checkbox"> 多线群聊</label>' +
         '<label>主卡<select aria-label="主卡（可多选）" multiple size="3"></select></label>' +
         '<label>关系世界书<select aria-label="关系世界书（可多选）" multiple size="3"></select></label>' +
-        '<label class="private-routes-style-label">预设文风' +
-        '<textarea aria-label="预设文风" rows="4" maxlength="12000" ' +
-        'placeholder="粘贴当前酒馆预设中的文风、人称、句式、语言和角色口吻规则。多线 JSON 协议会自动保持最高优先级。明确写“让某副卡……”“@某副卡……”时，会生成该副卡的导演指令。"></textarea>' +
-        '</label>' +
         '<span role="status" aria-live="polite"></span>';
     const enabled = root.querySelector('input[type="checkbox"]');
     const main = root.querySelector('select[aria-label="主卡（可多选）"]');
     const worldbook = root.querySelector('select[aria-label="关系世界书（可多选）"]');
-    const style = root.querySelector('textarea[aria-label="预设文风"]');
     const indicator = root.querySelector('span[role="status"]');
-    ui = { root, enabled, main, worldbook, style, status: indicator, sendForm };
+    ui = { root, enabled, main, worldbook, status: indicator, sendForm };
     sendForm.before(root);
     enabled.addEventListener('change', () => {
         const { config } = current();
@@ -567,12 +579,6 @@ function initialize() {
         status = '';
         getContext().saveSettingsDebounced();
         render();
-    });
-    style.addEventListener('input', () => {
-        const { config } = current();
-        if (!config) return;
-        config.stylePrompt = style.value;
-        getContext().saveSettingsDebounced();
     });
     document.addEventListener('click', onClick, true);
     document.addEventListener('keydown', onKey, true);

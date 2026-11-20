@@ -41,7 +41,6 @@
     opacity: 0.55;
     pointer-events: none;
 }
-
 #private-routes-live {
     margin: 0.5rem 0;
     padding: 0.6rem 0.75rem;
@@ -58,17 +57,4 @@
 
 #private-routes-live .private-routes-live-content {
     overflow-wrap: anywhere;
-}
-
-#private-routes .private-routes-style-label {
-    display: grid;
-    gap: 0.25rem;
-    flex: 1 1 100%;
-    white-space: normal;
-}
-
-#private-routes textarea[aria-label="预设文风"] {
-    width: 100%;
-    min-width: min(34rem, 70vw);
-    resize: vertical;
 }
