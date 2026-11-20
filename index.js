@@ -172,7 +172,8 @@ function roleSheet(card, otherName) {
         sheet,
         showStatusBar: (Array.isArray(data.extensions?.regex_scripts)
             && data.extensions.regex_scripts.some(rule => rule?.scriptName === '团子状态栏' && !rule.disabled))
-            || (typeof data.system_prompt === 'string' && data.system_prompt.includes('aff_luye')),
+            || (typeof data.system_prompt === 'string'
+                && (data.system_prompt.includes('state_updates') || data.system_prompt.includes('【团子状态】'))),
     };
 }
 
@@ -280,9 +281,24 @@ function syncStateVariables(context, state, main, player, sides) {
     const playerId = player.id ?? PLAYER;
     const routes = [{ id: playerId, name: player.name }, ...sides.map(card => ({ id: card.id, name: card.name }))];
     const affinity = state?.affinity ?? {};
+    const familiarity = state?.familiarity ?? {};
+    const tension = state?.tension ?? {};
+    const stage = state?.stage ?? {};
+    const unresolved = state?.unresolved ?? {};
     const value = id => String(Number.isFinite(Number(affinity[id])) ? affinity[id] : 0);
+    const relationKey = (route, index) => route.id === playerId
+        ? 'me'
+        : `route_${index}`;
     local.set('aff_me', value(playerId));
     local.set('aff_user', value(playerId));
+    local.set('relationship_mode', state?.relationshipMode || 'new');
+    for (const [index, route] of routes.entries()) {
+        const key = relationKey(route, index);
+        local.set(`familiarity_${key}`, String(Number.isFinite(Number(familiarity[route.id])) ? familiarity[route.id] : 0));
+        local.set(`tension_${key}`, String(Number.isFinite(Number(tension[route.id])) ? tension[route.id] : 0));
+        local.set(`relationship_stage_${key}`, String(stage[route.id] || '初识'));
+        local.set(`unresolved_${key}`, JSON.stringify(Array.isArray(unresolved[route.id]) ? unresolved[route.id] : []));
+    }
     const luye = routes.find(route => route.name === '路野' || route.name === '周野');
     const lushi = routes.find(route => route.name === '陆时');
     if (luye) {
